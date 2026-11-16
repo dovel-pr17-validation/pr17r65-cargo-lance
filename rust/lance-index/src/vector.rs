@@ -1,0 +1,767 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Vector Index
+//!
+
+use crate::scalar::{RowAddrTranslator, materialize_remap};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::any::Any;
+use std::fmt::Debug;
+use std::sync::Arc;
+
+use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
+use arrow_schema::Field;
+use async_trait::async_trait;
+use datafusion_execution::SendableRecordBatchStream;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use futures::stream;
+use ivf::storage::IvfModel;
+use lance_core::deepsize::DeepSizeOf;
+use lance_core::{Error, ROW_ID_FIELD, Result};
+use lance_io::traits::Reader;
+use lance_linalg::distance::DistanceType;
+use quantizer::{QuantizationType, Quantizer};
+use roaring::RoaringBitmap;
+use std::sync::LazyLock;
+use v3::subindex::SubIndexType;
+
+pub mod bq;
+pub mod distributed;
+pub(crate) mod exact_buffers;
+pub mod flat;
+pub mod graph;
+pub mod hnsw;
+pub mod ivf;
+pub mod kmeans;
+pub mod pairwise;
+pub mod pca;
+pub mod pq;
+pub mod pretransform;
+pub mod quantizer;
+pub mod residual;
+pub mod shared;
+pub mod sq;
+pub mod storage;
+pub mod transform;
+pub mod utils;
+pub mod v3;
+pub mod warp;
+
+use super::pb;
+use crate::metrics::MetricsCollector;
+use crate::{Index, prefilter::PreFilter};
+
+// TODO: Make these crate private once the migration from lance to lance-index is done.
+pub const DIST_COL: &str = "_distance";
+pub const DISTANCE_TYPE_KEY: &str = "distance_type";
+pub const INDEX_UUID_COLUMN: &str = "__index_uuid";
+pub const PART_ID_COLUMN: &str = "__ivf_part_id";
+pub const DIST_Q_C_COLUMN: &str = "__dist_q_c";
+// dist from vector to centroid
+pub const CENTROID_DIST_COLUMN: &str = "__centroid_dist";
+pub const PQ_CODE_COLUMN: &str = "__pq_code";
+pub const SQ_CODE_COLUMN: &str = "__sq_code";
+pub const LOSS_METADATA_KEY: &str = "_loss";
+
+pub type PreparedPartitionSearchHandle = Box<dyn Any + Send>;
+
+/// Controls when a multi-partition search should stop producing more partition results.
+pub trait PartitionSearchControl: Send + Sync {
+    fn should_stop(&self) -> bool;
+
+    fn record_batch(&self, _batch: &RecordBatch) {}
+}
+
+pub static VECTOR_RESULT_SCHEMA: LazyLock<arrow_schema::SchemaRef> = LazyLock::new(|| {
+    arrow_schema::SchemaRef::new(arrow_schema::Schema::new(vec![
+        Field::new(DIST_COL, arrow_schema::DataType::Float32, true),
+        ROW_ID_FIELD.clone(),
+    ]))
+});
+
+pub static PART_ID_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
+    arrow_schema::Field::new(PART_ID_COLUMN, arrow_schema::DataType::UInt32, true)
+});
+
+pub static CENTROID_DIST_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
+    arrow_schema::Field::new(CENTROID_DIST_COLUMN, arrow_schema::DataType::Float32, true)
+});
+
+pub const DEFAULT_QUERY_PARALLELISM: i32 = 0;
+
+/// Controls the speed / accuracy tradeoff for approximate vector search.
+///
+/// This currently affects RQ-quantized vector indexes (such as IVF_RQ) and
+/// HNSW sub-index searches that exclude rows (for example through a prefilter
+/// or deletions), where `Fast` enables the ACORN traversal. Other index types
+/// ignore this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApproxMode {
+    /// Prefer lower query latency, which can reduce recall.
+    Fast,
+
+    /// Use the default balance between query latency and recall.
+    #[default]
+    Normal,
+
+    /// Prefer higher recall, which can increase query latency.
+    Accurate,
+}
+
+/// Caller-supplied IVF probe parameters before defaults and precedence are resolved.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProbeParams {
+    /// Fixed probe count, used only when `search_effort` is absent.
+    pub nprobes: Option<usize>,
+    /// Explicit lower bound, overriding the fixed count's lower bound. Defaults to 1.
+    pub minimum_nprobes: Option<usize>,
+    /// Explicit upper bound, overriding the fixed count's upper bound.
+    /// Without either bound or a fixed count, all partitions are available.
+    pub maximum_nprobes: Option<usize>,
+    /// Optional effort in [0, 1]. Absence resolves to 0.5; any supplied value
+    /// ignores `nprobes`, including an explicit 0.5.
+    pub search_effort: Option<f64>,
+}
+
+impl ProbeParams {
+    /// Resolve the minimum, maximum and effort used by [`Query`].
+    ///
+    /// Explicit minimum and maximum bounds remain effective when effort is set.
+    ///
+    /// ```
+    /// use lance_index::vector::ProbeParams;
+    /// let params = ProbeParams {
+    ///     nprobes: Some(20),
+    ///     search_effort: Some(0.5),
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(params.resolve(), (1, None, 0.5));
+    /// ```
+    pub fn resolve(&self) -> (usize, Option<usize>, f64) {
+        let fixed = self.nprobes.filter(|_| self.search_effort.is_none());
+        (
+            self.minimum_nprobes.or(fixed).unwrap_or(1),
+            self.maximum_nprobes.or(fixed),
+            self.search_effort.unwrap_or(0.5),
+        )
+    }
+}
+
+/// Resolved query parameters for the vector indices.
+
+#[derive(Debug, Clone)]
+pub struct Query {
+    /// The column to be searched.
+    pub column: String,
+
+    /// The vector to be searched.
+    pub key: ArrayRef,
+
+    /// Top k results to return.
+    pub k: usize,
+
+    /// The lower bound (inclusive) of the distance to be searched.
+    pub lower_bound: Option<f32>,
+
+    /// The upper bound (exclusive) of the distance to be searched.
+    pub upper_bound: Option<f32>,
+
+    /// The minimum number of probes to load and search.  More partitions
+    /// will only be loaded if we have not found k results, or the algorithm
+    /// determines more partitions are needed to satisfy recall requirements.
+    ///
+    /// The planner will always search at least this many partitions. Defaults to 1.
+    pub minimum_nprobes: usize,
+
+    /// The maximum number of probes to load and search.  If not set then
+    /// ALL partitions will be searched, if needed, to satisfy k results.
+    pub maximum_nprobes: Option<usize>,
+
+    /// Initial IVF search effort in [0, 1], default 0.5.
+    ///
+    /// At 0.5, preserve Auto probing. At 0, start at the caller minimum (at
+    /// least one available partition); at 1, start at all available partitions,
+    /// subject to the caller maximum. For L2, cosine and dot with k <= 100000,
+    /// 0.1 and 0.25 select profiles targeting 80% and 90% mean partition-routing
+    /// recall; 0.5 retains Auto's nominal 95% target. These are empirical targets,
+    /// not per-query guarantees or end-to-end Recall@k guarantees. Intermediate
+    /// budgets interpolate geometrically between these anchors. Hamming and
+    /// larger k interpolate around their existing Auto budget without calibrated
+    /// targets. Later candidate-count expansion is unchanged.
+    /// Caller options are resolved by [`ProbeParams`] before execution: an explicit
+    /// effort ignores fixed `nprobes`, while explicit minimum/maximum bounds remain.
+    /// This does not control quantization accuracy, HNSW ef, or refinement.
+    pub search_effort: f64,
+
+    /// The number of candidates to reserve while searching.
+    /// this is an optional parameter for HNSW related index types.
+    /// Unset defaults to `1.5 * k * refine_factor`, floored at
+    /// [`crate::vector::hnsw::builder::DEFAULT_MIN_EF`].
+    pub ef: Option<usize>,
+
+    /// If presented, apply a refine step.
+    /// TODO: should we support fraction / float number here?
+    pub refine_factor: Option<u32>,
+
+    /// Distance metric type. If None, uses the index's metric (if available)
+    /// or the default for the data type.
+    pub metric_type: Option<DistanceType>,
+
+    /// Whether to use an ANN index if available
+    pub use_index: bool,
+
+    /// Maximum partition-search concurrency for a single vector query.
+    ///
+    /// The default is 0.
+    /// Value 0 selects the automatic policy; today this resolves to 1 for the
+    /// sequential fast path unless an index implementation overrides it.
+    /// Value -1 uses the CPU pool size.
+    /// Value 1 uses the single-worker sequential partition search path.
+    /// Values >= 2 use the partition-parallel path and are clamped to the CPU
+    /// pool size by the execution layer.
+    pub query_parallelism: i32,
+
+    /// the distance between the query and the centroid
+    /// this is only used for IVF index with Rabit quantization
+    pub dist_q_c: f32,
+
+    /// Controls the speed / accuracy tradeoff for approximate vector search.
+    ///
+    /// This currently affects RQ-quantized vector indexes (such as IVF_RQ) and
+    /// HNSW sub-index searches that exclude rows (for example through a
+    /// prefilter or deletions), where `Fast` enables the ACORN traversal. Other
+    /// index types ignore this setting.
+    pub approx_mode: ApproxMode,
+}
+
+impl Query {
+    /// Validate the resolved effort range.
+    pub fn validate_search_effort(&self) -> Result<()> {
+        if !self.search_effort.is_finite() || !(0.0..=1.0).contains(&self.search_effort) {
+            return Err(Error::invalid_input(format!(
+                "search_effort must be finite and in [0, 1], got {}",
+                self.search_effort
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Stable partition-local identity for one candidate emitted by an IVF search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DeepSizeOf)]
+pub struct PartitionSearchCandidate {
+    /// IVF partition containing the candidate.
+    pub partition_id: u32,
+    /// Zero-based offset inside the partition's vector storage.
+    pub offset_in_partition: u32,
+}
+
+/// Result of a partition search that also exposes identities suitable for
+/// selected-candidate re-scoring.
+#[derive(Debug, Clone)]
+pub struct PartitionSearchResult {
+    /// Ordinary `(distance, row id)` result batch.
+    pub batch: RecordBatch,
+    /// Candidate identities in the same order as rows in `batch`.
+    pub candidates: Vec<PartitionSearchCandidate>,
+}
+
+impl From<pb::VectorMetricType> for DistanceType {
+    fn from(proto: pb::VectorMetricType) -> Self {
+        match proto {
+            pb::VectorMetricType::L2 => Self::L2,
+            pb::VectorMetricType::Cosine => Self::Cosine,
+            pb::VectorMetricType::Dot => Self::Dot,
+            pb::VectorMetricType::Hamming => Self::Hamming,
+        }
+    }
+}
+
+impl From<DistanceType> for pb::VectorMetricType {
+    fn from(mt: DistanceType) -> Self {
+        match mt {
+            DistanceType::L2 => Self::L2,
+            DistanceType::Cosine => Self::Cosine,
+            DistanceType::Dot => Self::Dot,
+            DistanceType::Hamming => Self::Hamming,
+        }
+    }
+}
+
+/// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
+///
+/// Vector indices are often built as a chain of indices.  For example, IVF -> PQ
+/// or IVF -> HNSW -> SQ.
+///
+/// We use one trait for both the top-level and the sub-indices.  Typically the top-level
+/// search is a partition-aware search and all sub-indices are whole-index searches.
+/// A partition prepared by [`VectorIndex::prepare_partition_rows`].
+pub struct PreparedPartitionRows {
+    /// Bytes of partition storage the preparation keeps alive until it is
+    /// scored, so callers can bound how much they hold at once.
+    pub size_bytes: usize,
+    /// Index-specific state consumed by
+    /// [`VectorIndex::score_prepared_partition_rows`].
+    pub handle: PreparedPartitionSearchHandle,
+}
+
+impl std::fmt::Debug for PreparedPartitionRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedPartitionRows")
+            .field("size_bytes", &self.size_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Every row of one partition scored against several queries, see
+/// [`VectorIndex::score_prepared_partition_rows`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PartitionRowDistances {
+    /// Rows with at least one vector in the partition that passes the
+    /// pre-filter, strictly ascending.
+    pub row_ids: Arc<[u64]>,
+    /// `distances[j][r]` is the smallest distance between query `j` and the
+    /// vectors of row `row_ids[r]` in the partition.
+    pub distances: Vec<Vec<f32>>,
+}
+
+#[async_trait]
+#[allow(clippy::redundant_pub_crate)]
+pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
+    /// Search entire index for k nearest neighbors.
+    ///
+    /// It returns a [RecordBatch] with Schema of:
+    ///
+    /// ```
+    /// use arrow_schema::{Schema, Field, DataType};
+    ///
+    /// Schema::new(vec![
+    ///   Field::new("_rowid", DataType::UInt64, true),
+    ///   Field::new("_distance", DataType::Float32, true),
+    /// ]);
+    /// ```
+    ///
+    /// The `pre_filter` argument is used to filter out row ids that we know are
+    /// not relevant to the query. For example, it removes deleted rows or rows that
+    /// do not match a user-provided filter.
+    async fn search(
+        &self,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch>;
+
+    /// Find partitions that may contain nearest neighbors.
+    ///
+    /// If maximum_nprobes is set then this method will return the partitions
+    /// that are most likely to contain the nearest neighbors (e.g. the closest
+    /// partitions to the query vector).
+    ///
+    /// Return the partition ids and the distances between the query and the centroids,
+    /// the results should be in sorted order from closest to farthest.
+    fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)>;
+
+    /// Get the total number of partitions in the index.
+    fn total_partitions(&self) -> usize;
+
+    /// Search a single partition for nearest neighbors.
+    ///
+    /// This method should return the same results as [`VectorIndex::search`] method except
+    /// that it will only search a single partition.
+    async fn search_in_partition(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch>;
+
+    /// Search one partition and preserve the local offsets of emitted rows.
+    ///
+    /// Implementations may reject this operation. Quantized refinement uses it
+    /// only for flat IVF_RQ sub-indices.
+    async fn search_in_partition_with_candidates(
+        &self,
+        _partition_id: usize,
+        _query: &Query,
+        _pre_filter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
+        _candidate_limit: usize,
+    ) -> Result<PartitionSearchResult> {
+        Err(Error::not_supported("search_in_partition_with_candidates"))
+    }
+
+    /// Score partition-local candidate offsets with the index's most accurate
+    /// native storage representation.
+    ///
+    /// The returned rows preserve the order of `offsets_in_partition`. This
+    /// operation does not apply a pre-filter or distance bounds; callers must
+    /// validate candidate identity and apply query result shaping around it.
+    async fn score_partition_candidates(
+        &self,
+        _partition_id: usize,
+        _query: &Query,
+        _offsets_in_partition: &[u32],
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        Err(Error::not_supported("score_partition_candidates"))
+    }
+
+    /// Prepare scoring every vector of one partition against each of
+    /// `queries`: load the partition and wait for the pre-filter, leaving only
+    /// CPU work for [`VectorIndex::score_prepared_partition_rows`].
+    ///
+    /// Unlike [`VectorIndex::search_in_partition`], the scoring ignores `k`,
+    /// `ef`, `refine_factor` and distance bounds and needs no heap or sort by
+    /// distance: it is for callers that consume every row of a partition, such
+    /// as WARP multivector search, and can batch many prepared partitions into
+    /// one CPU task.
+    ///
+    /// The default implementation rejects the operation.
+    async fn prepare_partition_rows(
+        &self,
+        _partition_id: usize,
+        _queries: &[Query],
+        _pre_filter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<PreparedPartitionRows> {
+        Err(Error::not_supported(
+            "scoring every row of a partition is not supported for this index",
+        ))
+    }
+
+    /// Score a partition prepared by [`VectorIndex::prepare_partition_rows`]:
+    /// every vector against each query, reduced to the closest vector of each
+    /// row. Rows the pre-filter removes are omitted. Runs synchronously, so
+    /// call it from a CPU task.
+    fn score_prepared_partition_rows(
+        &self,
+        _prepared: PreparedPartitionRows,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<PartitionRowDistances> {
+        Err(Error::not_supported(
+            "scoring every row of a partition is not supported for this index",
+        ))
+    }
+
+    /// Asynchronously prepare a single-partition search so the CPU-heavy portion
+    /// can be executed separately.
+    async fn prepare_partition_search(
+        &self,
+        _partition_id: usize,
+        _query: &Query,
+        _pre_filter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<PreparedPartitionSearchHandle> {
+        unimplemented!("prepared partition search is not supported for this index")
+    }
+
+    /// Execute the synchronous portion of a previously prepared partition search.
+    fn search_prepared_partition(
+        &self,
+        _prepared: PreparedPartitionSearchHandle,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        unimplemented!("prepared partition search is not supported for this index")
+    }
+
+    /// Return true if the index supports splitting partition search into async
+    /// prepare and sync execute phases.
+    fn supports_prepared_partition_search(&self) -> bool {
+        false
+    }
+
+    /// Choose partition search concurrency for `query_parallelism = 0`.
+    ///
+    /// The default keeps the single-worker sequential path. Index
+    /// implementations can override this when their sub-index search work does
+    /// not benefit from the sequential fast path.
+    fn auto_query_parallelism(&self, _cpu_pool_size: usize) -> usize {
+        1
+    }
+
+    /// Prepare a query and index pair for the partition-search stage.
+    ///
+    /// Decorators can transform the query once and return their wrapped index,
+    /// allowing both sequential and partition-parallel execution to reuse the
+    /// prepared query. The default returns `None` to keep the original pair.
+    ///
+    /// Decorators such as [`crate::vector::pretransform::PreTransformIndex`]
+    /// must override every method that receives a query. A new method that keeps
+    /// this default will skip the pre-transform and search the original vectors.
+    fn prepare_partition_query(
+        self: Arc<Self>,
+        _query: &Query,
+    ) -> Result<Option<(Arc<dyn VectorIndex>, Query)>>
+    where
+        Self: 'static,
+    {
+        Ok(None)
+    }
+
+    /// Search a range of partitions and return a stream of per-partition result batches.
+    ///
+    /// The default implementation searches each partition sequentially with
+    /// [`VectorIndex::search_in_partition`]. Implementations can override this
+    /// to use a more efficient execution strategy.
+    #[allow(clippy::too_many_arguments)]
+    async fn search_partitions(
+        self: Arc<Self>,
+        query: Query,
+        partitions: Arc<UInt32Array>,
+        q_c_dists: Arc<Float32Array>,
+        start_idx: usize,
+        end_idx: usize,
+        pre_filter: Arc<dyn PreFilter>,
+        control: Option<Arc<dyn PartitionSearchControl>>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<SendableRecordBatchStream>
+    where
+        Self: 'static,
+    {
+        if partitions.len() != q_c_dists.len() {
+            return Err(Error::invalid_input(format!(
+                "partition count {} does not match centroid distance count {}",
+                partitions.len(),
+                q_c_dists.len()
+            )));
+        }
+        if start_idx > end_idx || end_idx > partitions.len() {
+            return Err(Error::invalid_input(format!(
+                "invalid partition search range [{start_idx}, {end_idx}) for {} partitions",
+                partitions.len()
+            )));
+        }
+
+        let stream = stream::try_unfold(start_idx, move |idx| {
+            let index = self.clone();
+            let partitions = partitions.clone();
+            let q_c_dists = q_c_dists.clone();
+            let query = query.clone();
+            let pre_filter = pre_filter.clone();
+            let control = control.clone();
+            let metrics = metrics.clone();
+            async move {
+                if idx >= end_idx
+                    || control
+                        .as_ref()
+                        .is_some_and(|control| control.should_stop())
+                {
+                    return Ok(None);
+                }
+                let part_id = partitions.value(idx);
+                let mut query = query;
+                query.dist_q_c = q_c_dists.value(idx);
+                index
+                    .search_in_partition(part_id as usize, &query, pre_filter, metrics.as_ref())
+                    .await
+                    .map(|batch| {
+                        if let Some(control) = control.as_ref() {
+                            control.record_batch(&batch);
+                        }
+                        Some((batch, idx + 1))
+                    })
+                    .map_err(Into::into)
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            VECTOR_RESULT_SCHEMA.clone(),
+            stream,
+        )))
+    }
+
+    /// Whether this index can search multiple query vectors in a single pass
+    /// via [`VectorIndex::search_partitions_batch`], reading each partition's
+    /// storage once and scoring every query that probes it.
+    ///
+    /// Defaults to `false`; callers should fall back to repeated single-query
+    /// search for indices that return `false`.
+    fn supports_batch_partition_search(&self) -> bool {
+        false
+    }
+
+    /// Search a batch of query vectors against a shared set of partitions.
+    ///
+    /// `query.key` holds all query vectors concatenated (length
+    /// `query_count * dim`, where `query_count == partitions_per_query.len()`).
+    /// `partitions_per_query[i]` / `q_c_dists_per_query[i]` are the ranked
+    /// partition ids and query-to-centroid distances for query `i`.
+    ///
+    /// Returns one [RecordBatch] per query (in query order) with the
+    /// [`VECTOR_RESULT_SCHEMA`] (`_distance`, `_rowid`) and at most `query.k`
+    /// rows each. Implementations should read each distinct partition's storage
+    /// only once and score every query assigned to it against the loaded data.
+    ///
+    /// The default implementation returns an error; callers must gate on
+    /// [`VectorIndex::supports_batch_partition_search`].
+    #[allow(clippy::too_many_arguments)]
+    async fn search_partitions_batch(
+        self: Arc<Self>,
+        query: Query,
+        partitions_per_query: Vec<Arc<UInt32Array>>,
+        q_c_dists_per_query: Vec<Arc<Float32Array>>,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<Vec<RecordBatch>>
+    where
+        Self: 'static,
+    {
+        let _ = (
+            query,
+            partitions_per_query,
+            q_c_dists_per_query,
+            pre_filter,
+            metrics,
+        );
+        Err(Error::not_supported(
+            "batch partition search is not supported for this index",
+        ))
+    }
+
+    /// If the index is loadable by IVF, so it can be a sub-index that
+    /// is loaded on demand by IVF.
+    fn is_loadable(&self) -> bool;
+
+    /// Use residual vector to search.
+    fn use_residual(&self) -> bool;
+
+    // async fn append(&self, batches: Vec<RecordBatch>) -> Result<()>;
+    // async fn merge(&self, indices: Vec<Arc<dyn VectorIndex>>) -> Result<()>;
+
+    /// Load the index from the reader on-demand.
+    async fn load(
+        &self,
+        reader: Arc<dyn Reader>,
+        offset: usize,
+        length: usize,
+    ) -> Result<Box<dyn VectorIndex>>;
+
+    /// Load the partition from the reader on-demand.
+    async fn load_partition(
+        &self,
+        reader: Arc<dyn Reader>,
+        offset: usize,
+        length: usize,
+        _partition_id: usize,
+    ) -> Result<Box<dyn VectorIndex>> {
+        self.load(reader, offset, length).await
+    }
+
+    // for IVF only
+    async fn partition_reader(
+        &self,
+        _partition_id: usize,
+        _with_vector: bool,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<SendableRecordBatchStream> {
+        unimplemented!("only for IVF")
+    }
+
+    /// A partition's stored rows, read without caching the partition.
+    async fn partition_storage_batches(&self, _partition_id: usize) -> Result<Vec<RecordBatch>> {
+        Err(Error::not_supported(
+            "partition_storage_batches is only supported by IVF indices",
+        ))
+    }
+
+    /// Whether bounded native code-to-code scoring is available (current format).
+    fn supports_pairwise_vectors(&self) -> bool {
+        false
+    }
+
+    /// Stage a partition's codes once, in storage order, for native
+    /// code-to-code tile scoring (see [`pairwise`] for the distance
+    /// definitions). `batch_size` is the maximum rows per staged batch.
+    /// Partitions staged beyond `memory_limit` bytes use the caller's spill store.
+    async fn prepare_pairwise_partition(
+        &self,
+        _partition_id: usize,
+        _batch_size: usize,
+        _memory_limit: usize,
+        _spill_store: &dyn lance_io::spill::SpillStore,
+    ) -> Result<pairwise::PairwisePartition> {
+        Err(lance_core::Error::not_supported(
+            "pair enumeration requires a current-format vector index; rebuild this index",
+        ))
+    }
+
+    // for SubIndex only
+    async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream>;
+
+    fn num_rows(&self) -> u64;
+
+    /// Return the IDs of rows in the index.
+    fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_>;
+
+    /// Remap the index according to mapping
+    ///
+    /// Each item in mapping describes an old row id -> new row id
+    /// pair.  If old row id -> None then that row id has been
+    /// deleted and can be removed from the index.
+    ///
+    /// If an old row id is not in the mapping then it should be
+    /// left alone.
+    ///
+    /// Legacy remapping API using an in-memory mapping. Retained for existing
+    /// callers and plugins; new tagged fragment reuse maintenance goes through
+    /// [`Self::remap_streaming`].
+    async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()>;
+
+    /// The fragments whose row addresses this index holds, or `None` when the
+    /// index cannot tell. Read only by the in-memory fallback of
+    /// [`Self::remap_streaming`], which maps every address of every listed
+    /// fragment explicitly and declines when the list is unknown; see
+    /// `ScalarIndex::stored_fragments` for the contract.
+    fn stored_fragments(&self) -> Option<RoaringBitmap> {
+        None
+    }
+
+    /// Remap the row ids through a translator whose payload may need reads.
+    ///
+    /// The default implementation hands a synchronous translator to
+    /// [`Self::remap`] as it is, and materializes a batch translator into a
+    /// complete in-memory mapping first (`materialize_remap`, bounded by the
+    /// translator's budget and requiring [`Self::stored_fragments`]), then
+    /// calls [`Self::remap`] once. It declines with a
+    /// [`RemapUnavailable`](crate::scalar::RemapUnavailable) when it cannot
+    /// prove a complete mapping within budget. Built-in indices translate one
+    /// unit of work at a time instead.
+    async fn remap_streaming(&mut self, translator: &RowAddrTranslator) -> Result<()> {
+        match translator {
+            RowAddrTranslator::Sync(mapping) => self.remap(mapping.as_ref()).await,
+            RowAddrTranslator::Batch(remapper) => {
+                let mapping =
+                    materialize_remap(remapper.as_ref(), self.stored_fragments().as_ref()).await?;
+                self.remap(&mapping).await
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(Error::not_supported(
+                "this build does not know how to translate through this row address translator",
+            )),
+        }
+    }
+
+    /// The metric type of this vector index.
+    fn metric_type(&self) -> DistanceType;
+
+    fn ivf_model(&self) -> &IvfModel;
+    fn quantizer(&self) -> Quantizer;
+    fn partition_size(&self, part_id: usize) -> usize;
+
+    /// the index type of this vector index.
+    fn sub_index_type(&self) -> (SubIndexType, QuantizationType);
+
+    /// The cumulative I/O performed while opening this index (file footers, IVF
+    /// centroids, quantization metadata).  This is a one-time cost; it is
+    /// reported once, on the query that actually opens the index, and is `None`
+    /// for index implementations that do not track it.
+    fn open_io_stats(&self) -> Option<lance_io::scheduler::ScanStats> {
+        None
+    }
+}
+
+// it can be an IVF index or a partition of IVF index
+pub trait VectorIndexCacheEntry: Debug + Send + Sync + DeepSizeOf {
+    fn as_any(&self) -> &dyn Any;
+}

@@ -1,0 +1,614 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.lance;
+
+import org.lance.index.IndexParams;
+import org.lance.index.IndexType;
+import org.lance.index.scalar.ScalarIndexParams;
+import org.lance.ipc.LanceScanner;
+import org.lance.ipc.ScanOptions;
+
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Path;
+import java.util.Collections;
+import java.util.Map;
+import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+public class SessionTest {
+
+  @Test
+  void testCreateSessionWithDefaults() {
+    try (Session session = Session.builder().build()) {
+      assertNotNull(session);
+      assertFalse(session.isClosed());
+      assertTrue(session.sizeBytes() >= 0);
+    }
+  }
+
+  @Test
+  void testCreateSessionWithCustomCacheSizes() {
+    long indexCacheSize = 512L * 1024 * 1024; // 512 MiB
+    long metadataCacheSize = 128L * 1024 * 1024; // 128 MiB
+
+    try (Session session =
+        Session.builder()
+            .indexCacheSizeBytes(indexCacheSize)
+            .metadataCacheSizeBytes(metadataCacheSize)
+            .build()) {
+      assertNotNull(session);
+      assertFalse(session.isClosed());
+      assertTrue(session.sizeBytes() >= 0);
+    }
+  }
+
+  @Test
+  void testCreateSessionWithPartialCustomCacheSizes() {
+    // Only set index cache size, metadata should use default
+    try (Session session = Session.builder().indexCacheSizeBytes(512L * 1024 * 1024).build()) {
+      assertNotNull(session);
+      assertFalse(session.isClosed());
+    }
+
+    // Only set metadata cache size, index should use default
+    try (Session session = Session.builder().metadataCacheSizeBytes(128L * 1024 * 1024).build()) {
+      assertNotNull(session);
+      assertFalse(session.isClosed());
+    }
+  }
+
+  @Test
+  void testCreateSessionWithCacheBackendUris() {
+    try (Session session =
+        Session.builder()
+            .indexCacheBackend("moka://?capacity=1048576")
+            .metadataCacheBackend("moka://?capacity=524288")
+            .build()) {
+      assertNotNull(session);
+      assertFalse(session.isClosed());
+      assertEquals(0, session.metadataCacheStats().getNumEntries());
+    }
+  }
+
+  @Test
+  void testCreateSessionWithStructuredCacheBackendConfigs() {
+    CacheBackendConfig indexBackend =
+        CacheBackendConfig.builder("moka").option("capacity", "1048576").build();
+    CacheBackendConfig metadataBackend =
+        CacheBackendConfig.builder("moka")
+            .options(Collections.singletonMap("capacity", "524288"))
+            .build();
+
+    assertEquals("moka", indexBackend.getKind());
+    assertEquals(Collections.singletonMap("capacity", "1048576"), indexBackend.getOptions());
+    assertThrows(
+        UnsupportedOperationException.class, () -> indexBackend.getOptions().put("capacity", "1"));
+
+    try (Session session =
+        Session.builder()
+            .indexCacheBackend(indexBackend)
+            .metadataCacheBackend(metadataBackend)
+            .build()) {
+      assertNotNull(session);
+      assertFalse(session.isClosed());
+    }
+  }
+
+  @Test
+  void testCacheBackendReplacesPreviousDescriptorForSameTier() {
+    CacheBackendConfig structuredBackend =
+        CacheBackendConfig.builder("moka").option("capacity", "1048576").build();
+
+    try (Session session =
+        Session.builder()
+            .indexCacheBackend("missing://")
+            .indexCacheBackend(structuredBackend)
+            .build()) {
+      assertNotNull(session);
+    }
+
+    try (Session session =
+        Session.builder()
+            .metadataCacheBackend(structuredBackend)
+            .metadataCacheBackend("moka://?capacity=1048576")
+            .build()) {
+      assertNotNull(session);
+    }
+  }
+
+  @Test
+  void testCacheBackendRejectsSizeAndBackend() {
+    IllegalArgumentException indexError =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                Session.builder()
+                    .indexCacheSizeBytes(1024)
+                    .indexCacheBackend("moka://?capacity=1048576")
+                    .build());
+    assertTrue(
+        indexError
+            .getMessage()
+            .contains("indexCacheSizeBytes and indexCacheBackend are mutually exclusive"));
+
+    IllegalArgumentException metadataError =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                Session.builder()
+                    .metadataCacheBackend(
+                        CacheBackendConfig.builder("moka").option("capacity", "1048576").build())
+                    .metadataCacheSizeBytes(1024)
+                    .build());
+    assertTrue(
+        metadataError
+            .getMessage()
+            .contains("metadataCacheSizeBytes and metadataCacheBackend are mutually exclusive"));
+  }
+
+  @Test
+  void testCacheBackendRejectsUnknownKind() {
+    IllegalArgumentException error =
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Session.builder().indexCacheBackend("missing://").build());
+    assertTrue(error.getMessage().contains("unknown cache backend kind"));
+  }
+
+  @Test
+  void testCacheBackendRejectsInvalidMokaConfig() {
+    IllegalArgumentException missingCapacity =
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Session.builder().indexCacheBackend("moka://").build());
+    assertTrue(missingCapacity.getMessage().contains("capacity is required"));
+
+    IllegalArgumentException unknownOption =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                Session.builder()
+                    .metadataCacheBackend(
+                        CacheBackendConfig.builder("moka").option("unknown", "value").build())
+                    .build());
+    assertTrue(unknownOption.getMessage().contains("unknown option"));
+  }
+
+  @Test
+  void testCacheBackendConfigValidatesInputs() {
+    assertThrows(NullPointerException.class, () -> CacheBackendConfig.builder(null));
+    assertThrows(IllegalArgumentException.class, () -> CacheBackendConfig.builder(""));
+    assertThrows(
+        NullPointerException.class,
+        () -> CacheBackendConfig.builder("moka").options((Map<String, String>) null));
+    assertThrows(
+        NullPointerException.class,
+        () -> CacheBackendConfig.builder("moka").option("capacity", null));
+  }
+
+  @Test
+  void testSessionClose() {
+    Session session = Session.builder().build();
+    assertFalse(session.isClosed());
+
+    session.close();
+    assertTrue(session.isClosed());
+
+    // Calling close again should be safe
+    session.close();
+    assertTrue(session.isClosed());
+  }
+
+  @Test
+  void testSessionSizeBytesAfterClose() {
+    Session session = Session.builder().build();
+    session.close();
+
+    assertThrows(IllegalArgumentException.class, session::sizeBytes);
+  }
+
+  @Test
+  void testSessionIsSameAs() {
+    try (Session session1 = Session.builder().build();
+        Session session2 = Session.builder().build()) {
+      // Same session should be equal to itself
+      assertTrue(session1.isSameAs(session1));
+      assertTrue(session2.isSameAs(session2));
+
+      // Different sessions should not be equal
+      assertFalse(session1.isSameAs(session2));
+      assertFalse(session2.isSameAs(session1));
+
+      // Null comparison
+      assertFalse(session1.isSameAs(null));
+    }
+  }
+
+  @Test
+  void testDatasetSharesSession(@TempDir Path tempDir) {
+    String datasetPath1 = tempDir.resolve("dataset1").toString();
+    String datasetPath2 = tempDir.resolve("dataset2").toString();
+
+    try (BufferAllocator allocator = new RootAllocator();
+        Session session = Session.builder().build()) {
+      // Create first dataset with session
+      TestUtils.SimpleTestDataset testDataset1 =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath1);
+      try (Dataset ds1 = testDataset1.createEmptyDataset()) {
+        // Now reopen with shared session
+        try (Dataset ds1WithSession =
+            Dataset.open().allocator(allocator).uri(datasetPath1).session(session).build()) {
+
+          // Create second dataset
+          TestUtils.SimpleTestDataset testDataset2 =
+              new TestUtils.SimpleTestDataset(allocator, datasetPath2);
+          try (Dataset ds2 = testDataset2.createEmptyDataset()) {
+            // Reopen with shared session
+            try (Dataset ds2WithSession =
+                Dataset.open().allocator(allocator).uri(datasetPath2).session(session).build()) {
+
+              // Both datasets should share the same session
+              Session session1 = ds1WithSession.session();
+              Session session2 = ds2WithSession.session();
+
+              assertNotNull(session1);
+              assertNotNull(session2);
+              assertTrue(session1.isSameAs(session2));
+              assertTrue(session1.isSameAs(session));
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testDatasetSessionFromReadOptions(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("dataset_session_options").toString();
+
+    try (BufferAllocator allocator = new RootAllocator();
+        Session session = Session.builder().build()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset ds = testDataset.createEmptyDataset()) {
+        // Reopen with session in ReadOptions
+        ReadOptions options = new ReadOptions.Builder().setSession(session).build();
+
+        try (Dataset dsWithSession =
+            Dataset.open().allocator(allocator).uri(datasetPath).readOptions(options).build()) {
+
+          Session datasetSession = dsWithSession.session();
+          assertNotNull(datasetSession);
+          assertTrue(datasetSession.isSameAs(session));
+        }
+      }
+    }
+  }
+
+  @Test
+  void testSessionPersistsAfterDatasetClose(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("dataset_session_persist").toString();
+
+    try (BufferAllocator allocator = new RootAllocator();
+        Session session = Session.builder().build()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      // Open and close dataset with session
+      Dataset ds = Dataset.open().allocator(allocator).uri(datasetPath).session(session).build();
+      ds.close();
+
+      // Session should still be open and usable
+      assertFalse(session.isClosed());
+      assertTrue(session.sizeBytes() >= 0);
+
+      // Can open another dataset with the same session
+      try (Dataset ds2 =
+          Dataset.open().allocator(allocator).uri(datasetPath).session(session).build()) {
+        assertNotNull(ds2.session());
+        assertTrue(ds2.session().isSameAs(session));
+      }
+    }
+  }
+
+  @Test
+  void testInternalSessionClosedWithDataset(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("dataset_internal_session").toString();
+
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      // Open dataset WITHOUT providing a session - internal session will be created
+      Dataset ds = Dataset.open().allocator(allocator).uri(datasetPath).build();
+
+      // Get the internal session
+      Session internalSession = ds.session();
+      assertNotNull(internalSession);
+      assertFalse(internalSession.isClosed());
+
+      // Close the dataset - internal session should be closed too
+      ds.close();
+
+      // The internal session should now be closed
+      assertTrue(internalSession.isClosed());
+    }
+  }
+
+  @Test
+  void testUserProvidedSessionNotClosedWithDataset(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("dataset_user_session").toString();
+
+    try (BufferAllocator allocator = new RootAllocator();
+        Session userSession = Session.builder().build()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      // Open dataset WITH user-provided session
+      Dataset ds =
+          Dataset.open().allocator(allocator).uri(datasetPath).session(userSession).build();
+
+      // Get the session from dataset - should be the same as user-provided
+      Session datasetSession = ds.session();
+      assertTrue(datasetSession.isSameAs(userSession));
+
+      // Close the dataset
+      ds.close();
+
+      // User-provided session should NOT be closed
+      assertFalse(userSession.isClosed());
+      assertTrue(userSession.sizeBytes() >= 0);
+    }
+  }
+
+  @Test
+  void testCheckedOutDatasetsShareInternalSession(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("dataset_checkout_session").toString();
+
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      try (Dataset source = Dataset.open().allocator(allocator).uri(datasetPath).build()) {
+        source.tags().create("version-one", Ref.ofMain(1));
+        Session sourceSession = source.session();
+
+        try (Dataset byVersion = source.checkoutVersion(1);
+            Dataset byTag = source.checkoutTag("version-one");
+            Dataset byRef = source.checkout(Ref.ofMain(1))) {
+          assertNotNull(byVersion.session());
+          assertNotNull(byTag.session());
+          assertNotNull(byRef.session());
+          assertTrue(byVersion.session().isSameAs(sourceSession));
+          assertTrue(byTag.session().isSameAs(sourceSession));
+          assertTrue(byRef.session().isSameAs(sourceSession));
+
+          source.close();
+          assertTrue(sourceSession.isClosed());
+          assertFalse(byVersion.session().isClosed());
+          assertFalse(byTag.session().isClosed());
+          assertFalse(byRef.session().isClosed());
+        }
+      }
+    }
+  }
+
+  @Test
+  void testSessionToString() {
+    try (Session session = Session.builder().build()) {
+      String str = session.toString();
+      assertNotNull(str);
+      assertTrue(str.startsWith("Session("));
+    }
+
+    Session closedSession = Session.builder().build();
+    closedSession.close();
+    assertEquals("Session(closed)", closedSession.toString());
+  }
+
+  @Test
+  void testMetadataCacheStats(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("dataset_metadata_cache_stats").toString();
+
+    try (BufferAllocator allocator = new RootAllocator();
+        Session session = Session.builder().build()) {
+      CacheStats initialStats = session.metadataCacheStats();
+      assertEquals(0, initialStats.getHits());
+      assertEquals(0, initialStats.getMisses());
+      assertEquals(0, initialStats.getNumEntries());
+      assertEquals(0, initialStats.getSizeBytes());
+      assertEquals(0.0, initialStats.getHitRatio());
+
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      // First open populates the metadata cache, producing misses
+      try (Dataset ds =
+          Dataset.open().allocator(allocator).uri(datasetPath).session(session).build()) {
+        ds.countRows();
+      }
+      CacheStats statsAfterFirstOpen = session.metadataCacheStats();
+      assertTrue(statsAfterFirstOpen.getMisses() > 0);
+      assertTrue(statsAfterFirstOpen.getNumEntries() > 0);
+      assertTrue(statsAfterFirstOpen.getSizeBytes() > 0);
+
+      // Reopening the same dataset should hit the shared metadata cache
+      try (Dataset ds =
+          Dataset.open().allocator(allocator).uri(datasetPath).session(session).build()) {
+        ds.countRows();
+      }
+      CacheStats statsAfterSecondOpen = session.metadataCacheStats();
+      assertTrue(statsAfterSecondOpen.getHits() > statsAfterFirstOpen.getHits());
+      assertTrue(statsAfterSecondOpen.getHitRatio() > 0.0);
+
+      // Stats are not accessible once the session is closed (close is idempotent,
+      // so the implicit close from try-with-resources remains safe)
+      session.close();
+      assertThrows(IllegalArgumentException.class, session::metadataCacheStats);
+    }
+  }
+
+  @Test
+  void testIndexCacheStatsAndCompleteDiagnostics() {
+    try (Session session =
+        Session.builder().indexCacheSizeBytes(0).metadataCacheSizeBytes(2048).build()) {
+      CacheStats indexStats = session.getIndexCacheStats();
+      assertEquals(0, indexStats.getHits());
+      assertEquals(0, indexStats.getMisses());
+      assertEquals(0, indexStats.getNumEntries());
+      assertEquals(0, indexStats.getSizeBytes());
+
+      CacheDiagnostics diagnostics = session.getCacheDiagnostics();
+      assertEquals(
+          CacheDiagnostics.BackendKind.QUICK, diagnostics.getIndex().getBackend().getKind());
+      assertEquals(0, diagnostics.getIndex().getBackend().getCapacityBytes().orElseThrow());
+      assertFalse(diagnostics.getIndex().getBackend().getEnabled().orElseThrow());
+      assertFalse(diagnostics.getIndex().getUtilization().isPresent());
+      assertEquals(2048, diagnostics.getMetadata().getBackend().getCapacityBytes().orElseThrow());
+      assertTrue(diagnostics.getMetadata().getBackend().getEnabled().orElseThrow());
+      assertEquals(0.0, diagnostics.getMetadata().getUtilization().orElseThrow());
+      assertEquals(0, diagnostics.getIndex().getActivity().getLoadsInFlight());
+      assertEquals(0, diagnostics.getIndex().getActivity().getWarm().getAttempts());
+      assertEquals(0, diagnostics.getMetadata().getActivity().getWarm().getLoadBytes());
+
+      CacheDiagnostics refreshed = session.getCacheDiagnostics(true);
+      assertEquals(0, refreshed.getMetadata().getBackend().getNumEntries().orElseThrow());
+
+      CacheDiagnosticsOptions options =
+          CacheDiagnosticsOptions.builder().refresh(true).byType(true).build();
+      assertTrue(options.getRefresh());
+      assertTrue(options.getByType());
+      CacheDiagnostics byType = session.getCacheDiagnostics(options);
+      CacheDiagnostics.ByType indexByType = byType.getIndex().getByType().orElseThrow();
+      assertTrue(indexByType.getActivity().isEmpty());
+      assertTrue(indexByType.getOccupancy().orElseThrow().getTypes().isEmpty());
+      assertEquals(0, indexByType.getTypeLabelOverflowEvents());
+
+      session.close();
+      assertThrows(IllegalArgumentException.class, session::getIndexCacheStats);
+      assertThrows(IllegalArgumentException.class, session::getCacheDiagnostics);
+    }
+  }
+
+  @Test
+  void testCacheDiagnosticsAfterIndexedReads(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("diagnostics").toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Session session = Session.builder().indexCacheBackend("moka://?capacity=1048576").build()) {
+      TestUtils.SimpleTestDataset fixture = new TestUtils.SimpleTestDataset(allocator, path);
+      fixture.createEmptyDataset().close();
+      fixture.write(1, 16).close();
+      try (Dataset dataset = fixture.write(2, 16)) {
+        dataset.createIndex(
+            Collections.singletonList("id"),
+            IndexType.BTREE,
+            Optional.of("id_idx"),
+            IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("btree")).build(),
+            true);
+      }
+      try (Dataset dataset =
+          Dataset.open().allocator(allocator).uri(path).session(session).build()) {
+        assertEquals(2, dataset.getFragments().size());
+        ScanOptions options = new ScanOptions.Builder().filter("id = 7").build();
+        try (LanceScanner scanner = dataset.newScan(options);
+            ArrowReader reader = scanner.scanBatches()) {
+          int rows = 0;
+          while (reader.loadNextBatch()) {
+            rows += reader.getVectorSchemaRoot().getRowCount();
+          }
+          assertEquals(2, rows);
+        }
+        CacheDiagnostics first = session.getCacheDiagnostics(true);
+        try (LanceScanner scanner = dataset.newScan(options);
+            ArrowReader reader = scanner.scanBatches()) {
+          int rows = 0;
+          while (reader.loadNextBatch()) {
+            rows += reader.getVectorSchemaRoot().getRowCount();
+          }
+          assertEquals(2, rows);
+        }
+        CacheDiagnostics second =
+            session.getCacheDiagnostics(
+                CacheDiagnosticsOptions.builder().refresh(true).byType(true).build());
+        CacheDiagnostics.Snapshot[] before = {first.getIndex(), first.getMetadata()};
+        CacheDiagnostics.Snapshot[] after = {second.getIndex(), second.getMetadata()};
+        for (int tier = 0; tier < after.length; tier++) {
+          CacheDiagnostics.Activity activity = after[tier].getActivity();
+          assertTrue(
+              activity.getHits() > before[tier].getActivity().getHits(), "cache tier " + tier);
+          assertTrue(activity.getMisses() > 0);
+          assertTrue(activity.getLoadsStarted() > 0);
+          assertEquals(activity.getLoadsStarted(), activity.getLoadsSucceeded());
+          assertTrue(activity.getLoadSuccessDurationNs() > 0);
+          assertEquals(0, activity.getLookupErrors());
+          assertEquals(0, activity.getLoadsFailed());
+          assertEquals(0, activity.getLoadsCancelled());
+          assertEquals(0, activity.getLoadsInFlight());
+          CacheDiagnostics.ByType byType = after[tier].getByType().orElseThrow();
+          assertFalse(byType.getActivity().isEmpty());
+          assertEquals(
+              activity.getHits(),
+              byType.getActivity().stream().mapToLong(row -> row.getActivity().getHits()).sum());
+          assertEquals(
+              activity.getMisses(),
+              byType.getActivity().stream().mapToLong(row -> row.getActivity().getMisses()).sum());
+          assertEquals(
+              activity.getLoadsSucceeded(),
+              byType.getActivity().stream()
+                  .mapToLong(row -> row.getActivity().getLoadsSucceeded())
+                  .sum());
+          assertFalse(byType.getOccupancy().orElseThrow().getTypes().isEmpty());
+          assertTrue(after[tier].getBackend().getWriteAttempts().orElseThrow() > 0);
+          assertTrue(after[tier].getBackend().getSizeBytes().orElseThrow() > 0);
+        }
+        assertEquals(CacheDiagnostics.BackendKind.MOKA, second.getIndex().getBackend().getKind());
+        assertEquals(
+            CacheDiagnostics.BackendKind.QUICK, second.getMetadata().getBackend().getKind());
+        assertFalse(second.getIndex().getBackend().getSizeRemovals().isPresent());
+        assertFalse(second.getIndex().getBackend().getAdmissions().isPresent());
+        assertTrue(
+            second.getIndex().getActivity().getHits() >= session.getIndexCacheStats().getHits());
+        assertTrue(
+            second.getMetadata().getActivity().getMisses()
+                >= session.metadataCacheStats().getMisses());
+      }
+    }
+  }
+
+  @Test
+  void testInvalidCacheSizes() {
+    assertThrows(
+        IllegalArgumentException.class, () -> Session.builder().indexCacheSizeBytes(-1).build());
+    assertThrows(
+        IllegalArgumentException.class, () -> Session.builder().metadataCacheSizeBytes(-1).build());
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> Session.builder().indexCacheSizeBytes(-1).metadataCacheSizeBytes(-1).build());
+  }
+}

@@ -1,0 +1,373 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
+"""
+File format compatibility tests for Lance.
+
+Tests that Lance files can be read and written across different versions,
+covering various data types and file format versions.
+"""
+
+import json
+from pathlib import Path
+
+import lance
+import pyarrow as pa
+import pytest
+from lance.file import LanceFileReader, LanceFileWriter
+
+from .compat_decorator import (
+    UpgradeDowngradeTest,
+    compat_test,
+)
+from .util import build_basic_types, build_large, safe_data_storage_version
+
+
+class RetentionCleanupCompatibility:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create_released(self):
+        for value in [1, 2, 3]:
+            lance.write_dataset(
+                pa.table({"value": [value] * 4}),
+                self.path,
+                mode="create" if value == 1 else "overwrite",
+                max_rows_per_file=2,
+                data_storage_version="2.0",
+            )
+        assert [v["version"] for v in lance.dataset(self.path).versions()] == [1, 2, 3]
+
+    def append_released(self):
+        assert [v["version"] for v in lance.dataset(self.path).versions()] == [
+            1,
+            2,
+            3,
+            4,
+        ]
+        before_files = len(list((self.path / "data").glob("*.lance")))
+        dataset = lance.write_dataset(
+            pa.table({"value": [99]}), self.path, mode="append"
+        )
+        assert [v["version"] for v in dataset.versions()] == [1, 2, 3, 4, 5]
+        assert len(list((self.path / "data").glob("*.lance"))) == before_files + 1
+        for version in range(1, 4):
+            assert lance.dataset(self.path, version=version).to_table() == pa.table(
+                {"value": [version] * 4}
+            )
+        assert dataset.to_table()["value"].to_pylist() == [3, 3, 3, 3, 99]
+
+    def enable_legacy_interval(self):
+        dataset = lance.dataset(self.path)
+        dataset.update_config(
+            {
+                "lance.auto_cleanup.interval": "1",
+                "lance.auto_cleanup.older_than": "30days",
+            }
+        )
+
+
+@pytest.mark.compat
+@pytest.mark.parametrize("shorthand", [False, True])
+def test_retention_auto_cleanup_remains_safe_for_released_writers(
+    venv_factory, tmp_path, shorthand
+):
+    case = RetentionCleanupCompatibility(tmp_path / "retention.lance")
+    released = venv_factory.get_venv("13.0.0")
+    released.execute_method(case, "create_released")
+    dataset = lance.dataset(case.path)
+    config = {"lance.auto_cleanup.policy_interval": "1"}
+    if shorthand:
+        config["lance.auto_cleanup.keep_one.per_interval"] = "1day"
+        config["lance.auto_cleanup.keep_one.older_than"] = "2days"
+    else:
+        config["lance.auto_cleanup.policy"] = json.dumps(
+            {
+                "rules": [
+                    {"type": "keep_one", "per_interval": "1h", "older_than": "2days"},
+                    {"type": "keep_one", "per_interval": "1day", "older_than": "7days"},
+                    {"type": "remove_all", "older_than": "30days"},
+                ]
+            }
+        )
+    applied = dataset.update_config(config)
+    assert "lance.auto_cleanup.interval" not in applied
+    released.execute_method(case, "append_released")
+    dataset = lance.write_dataset(pa.table({"value": [100]}), case.path, mode="append")
+    assert [v["version"] for v in dataset.versions()] == [1, 2, 3, 4, 5, 6]
+    assert dataset.to_table()["value"].to_pylist() == [3, 3, 3, 3, 99, 100]
+
+
+@pytest.mark.compat
+def test_released_legacy_interval_does_not_block_upgraded_writes(
+    venv_factory, tmp_path
+):
+    case = RetentionCleanupCompatibility(tmp_path / "retention.lance")
+    released = venv_factory.get_venv("13.0.0")
+    released.execute_method(case, "create_released")
+    dataset = lance.dataset(case.path)
+    dataset.update_config(
+        {
+            "lance.auto_cleanup.policy_interval": "1",
+            "lance.auto_cleanup.policy": json.dumps(
+                {
+                    "rules": [
+                        {
+                            "type": "keep_one",
+                            "per_interval": "1h",
+                            "older_than": "2days",
+                        },
+                        {
+                            "type": "keep_one",
+                            "per_interval": "1day",
+                            "older_than": "7days",
+                        },
+                        {"type": "remove_all", "older_than": "30days"},
+                    ]
+                }
+            ),
+        }
+    )
+    released.execute_method(case, "enable_legacy_interval")
+    dataset = lance.write_dataset(pa.table({"value": [100]}), case.path, mode="append")
+    assert [v["version"] for v in dataset.versions()] == [1, 2, 3, 4, 5, 6]
+    assert dataset.to_table()["value"].to_pylist() == [3, 3, 3, 3, 100]
+
+
+class ManagedBlobCompatibility:
+    """Methods run in released clients through the existing compat venv runner."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        field = lance.blob_field("blob").with_metadata(
+            {
+                "lance-encoding:blob-inline-size-threshold": "8",
+                "lance-encoding:blob-dedicated-size-threshold": "24",
+            }
+        )
+        table = pa.Table.from_arrays(
+            [lance.blob_array([b"p" * 16, b"d" * 32, None, b""])],
+            schema=pa.schema([field]),
+        )
+        lance.write_dataset(
+            table,
+            self.path,
+            data_storage_version="2.2",
+            max_rows_per_file=2,
+            max_rows_per_group=2,
+        )
+
+    def check_unflagged(self):
+        dataset = lance.dataset(self.path)
+        assert dataset.count_rows() == 4
+        assert [
+            row["blob"]["kind"] if row["blob"] else None
+            for row in dataset.to_table().to_pylist()
+        ] == [1, 2, None, 0]
+
+    def check_fenced(self):
+        with pytest.raises(ValueError, match="cannot be read by this version"):
+            lance.dataset(self.path)
+        # Opening for append must also honor the table fence before publishing.
+        table = pa.Table.from_arrays(
+            [lance.blob_array([b"inline"])],
+            schema=pa.schema([lance.blob_field("blob")]),
+        )
+        with pytest.raises(OSError, match="cannot be (read|written) by this version"):
+            lance.write_dataset(
+                table, self.path, mode="append", data_storage_version="2.2"
+            )
+        # The fence applies to snapshots. Historical unflagged reads remain valid;
+        # this must not be mistaken for permission to run old maintenance clients.
+        assert lance.dataset(self.path, version=1).count_rows() == 4
+
+    def write_config(self):
+        dataset = lance.dataset(self.path)
+        dataset.update_config({"test": "released-writer"})
+
+
+@pytest.mark.compat
+@pytest.mark.parametrize("version", ["11.0.0", "13.0.0"])
+def test_default_blob_writes_and_compaction_remain_compatible(
+    venv_factory, tmp_path, version
+):
+    case = ManagedBlobCompatibility(tmp_path / "blobs.lance")
+    case.create()
+    released = venv_factory.get_venv(version)
+    released.execute_method(case, "check_unflagged")
+    dataset = lance.dataset(case.path)
+    dataset.optimize.compact_files(
+        target_rows_per_fragment=100, data_storage_version="2.2"
+    )
+    released.execute_method(case, "check_unflagged")
+    released.execute_method(case, "write_config")
+    assert lance.dataset(case.path).count_rows() == 4
+
+
+@pytest.mark.compat
+@pytest.mark.parametrize("version", ["11.0.0", "13.0.0"])
+def test_managed_blob_activation_and_restore_fence(venv_factory, tmp_path, version):
+    case = ManagedBlobCompatibility(tmp_path / "blobs.lance")
+    released = venv_factory.get_venv(version)
+    released.execute_method(case, "create")
+    dataset = lance.dataset(case.path)
+    dataset.update_config({"test": "metadata-only"})
+    released.execute_method(case, "check_unflagged")
+    dataset.update_schema_metadata({"lance.blob.managed": "true"})
+    released.execute_method(case, "check_fenced")
+    dataset.optimize.compact_files(
+        target_rows_per_fragment=100, data_storage_version="2.2"
+    )
+    assert dataset.to_table(blob_handling="all_binary")["blob"].to_pylist() == [
+        b"p" * 16,
+        b"d" * 32,
+        None,
+        b"",
+    ]
+    version_before = dataset.version
+    released.execute_method(case, "check_fenced")
+    assert lance.dataset(case.path).version == version_before
+    old = lance.dataset(case.path, version=1)
+    old.restore()
+    released.execute_method(case, "check_fenced")
+    assert lance.dataset(case.path).to_table(blob_handling="all_binary")[
+        "blob"
+    ].to_pylist() == [
+        b"p" * 16,
+        b"d" * 32,
+        None,
+        b"",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("lance_version", "expected_storage_version"),
+    [
+        ("0.36.0", "2.0"),
+        ("0.38.0", "2.1"),
+        ("0.39.0", "2.1"),
+        ("11.0.0", "2.1"),
+    ],
+)
+def test_safe_data_storage_version(lance_version, expected_storage_version):
+    assert safe_data_storage_version(lance_version) == expected_storage_version
+
+
+# We start testing against the first release where 2.1 was stable. Before that
+# the format was unstable so the readers will panic.
+@compat_test(min_version="0.38.0")
+class BasicTypes2_1(UpgradeDowngradeTest):
+    """Test file format 2.1 compatibility with basic data types."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        batch = build_basic_types()
+        with LanceFileWriter(
+            str(self.path), version="2.1", schema=batch.schema
+        ) as writer:
+            writer.write_batch(batch)
+
+    def check_read(self):
+        reader = LanceFileReader(str(self.path))
+        table = reader.read_all().to_table()
+        assert table == build_basic_types()
+
+    def check_write(self):
+        # Test with overwrite
+        with LanceFileWriter(str(self.path), version="2.1") as writer:
+            writer.write_batch(build_basic_types())
+
+
+# File format 2.2 is not in the stable 2.0.x line.
+@compat_test(min_version="4.0.0")
+class BasicTypes2_2(UpgradeDowngradeTest):
+    """Test file format 2.2 compatibility with basic data types."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        batch = build_basic_types()
+        with LanceFileWriter(
+            str(self.path), version="2.2", schema=batch.schema
+        ) as writer:
+            writer.write_batch(batch)
+
+    def check_read(self):
+        reader = LanceFileReader(str(self.path))
+        table = reader.read_all().to_table()
+        assert table == build_basic_types()
+
+    def check_write(self):
+        with LanceFileWriter(str(self.path), version="2.2") as writer:
+            writer.write_batch(build_basic_types())
+
+
+@compat_test(min_version="0.16.0")
+@pytest.mark.parametrize(
+    "data_factory,name",
+    [
+        (build_basic_types, "basic_types"),
+        (build_large, "large"),
+    ],
+    ids=["basic_types", "large"],
+)
+class FileCompat(UpgradeDowngradeTest):
+    """Test file format compatibility with different data types.
+
+    Tests both basic types (scalars, strings, etc.) and large data (vectors, binary).
+    """
+
+    def __init__(self, path: Path, data_factory, name: str):
+        self.path = path
+        self.data_factory = data_factory
+        self.name = name
+
+    def create(self):
+        """Create Lance file with test data."""
+        batch = self.data_factory()
+        with LanceFileWriter(
+            str(self.path), version="2.0", schema=batch.schema
+        ) as writer:
+            writer.write_batch(batch)
+
+    def check_read(self):
+        """Verify file can be read and data matches."""
+        reader = LanceFileReader(str(self.path))
+        table = reader.read_all().to_table()
+        expected = self.data_factory()
+        assert table.equals(expected), f"Data mismatch for {self.name}"
+
+    def check_write(self):
+        """Verify can overwrite the file."""
+        batch = self.data_factory()
+        with LanceFileWriter(str(self.path), version="2.0") as writer:
+            writer.write_batch(batch)
+
+
+@compat_test(min_version="0.16.0")
+class BasicTypesLegacy(UpgradeDowngradeTest):
+    """Test legacy data storage version 0.1 compatibility."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        batch = build_basic_types()
+        lance.write_dataset(batch, self.path, data_storage_version="0.1")
+
+    def check_read(self):
+        ds = lance.dataset(self.path)
+        table = ds.to_table()
+        assert table == build_basic_types()
+
+    def check_write(self):
+        ds = lance.dataset(self.path)
+        ds.delete("true")
+        lance.write_dataset(
+            build_basic_types(), self.path, data_storage_version="0.1", mode="append"
+        )

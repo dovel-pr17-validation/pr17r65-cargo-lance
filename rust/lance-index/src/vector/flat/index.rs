@@ -1,0 +1,901 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Flat Vector Index.
+//!
+
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::collections::BinaryHeap;
+use std::sync::Arc;
+
+use arrow::array::AsArray;
+use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use lance_core::deepsize::DeepSizeOf;
+use lance_core::{Error, ROW_ID_FIELD, Result};
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
+use lance_linalg::distance::DistanceType;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    metrics::{IndexTimer, IndexTiming, MetricsCollector},
+    prefilter::PreFilter,
+    vector::{
+        ApproxMode, DIST_COL, PartitionSearchCandidate, PartitionSearchResult, Query,
+        graph::{OrderedFloat, OrderedNode},
+        quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
+        storage::{
+            DistCalculator, DistanceCalculatorOptions, QueryResidual, QueryScratch, VectorStore,
+        },
+        v3::subindex::IvfSubIndex,
+    },
+};
+
+use super::storage::{FLAT_COLUMN, FlatBinStorage, FlatFloatStorage};
+
+#[inline(always)]
+fn push_candidate_local<T: Eq>(
+    res: &mut BinaryHeap<OrderedNode<T>>,
+    k: usize,
+    candidate: T,
+    dist: OrderedFloat,
+) {
+    if k == 0 {
+        return;
+    }
+    if res.len() < k {
+        res.push(OrderedNode::new(candidate, dist));
+    } else if res.peek().is_some_and(|node| node.dist > dist) {
+        res.pop();
+        res.push(OrderedNode::new(candidate, dist));
+    }
+}
+
+/// A Flat index is any index that stores no metadata, and
+/// during query, it simply scans over the storage and returns the top k results
+#[derive(Debug, Clone, Default, DeepSizeOf)]
+pub struct FlatIndex {}
+
+use std::sync::LazyLock;
+
+static ANN_SEARCH_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Schema::new(vec![
+        Field::new(DIST_COL, DataType::Float32, true),
+        ROW_ID_FIELD.clone(),
+    ])
+    .into()
+});
+
+/// A partition goes through the screened top-k scan only when it has more
+/// than this many rows per result. Screening computes a quantized sum for every
+/// row and then rescores its candidates exactly, in SIMD chunks of 16; with few
+/// rows per result most rows end up rescored, so the quantization and sums
+/// cost more than the scoring they skip. With 4-bit PQ at m=96 it lost to the
+/// bulk scan at 2.5 rows per result on x86 (won on Graviton3), and won on both
+/// at 5. Those ratios were measured when this routing was added, before later
+/// changes to candidate selection and the kernels, and have not been re-tuned.
+const MIN_ROWS_PER_RESULT_FOR_TOPK_SCAN: usize = 4;
+
+/// Marker schema for the flat index, which stores no data of its own.
+static FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
+});
+
+#[derive(Default)]
+pub struct FlatQueryParams {
+    lower_bound: Option<f32>,
+    upper_bound: Option<f32>,
+    dist_q_c: f32,
+    approx_mode: ApproxMode,
+}
+
+impl From<&Query> for FlatQueryParams {
+    fn from(q: &Query) -> Self {
+        Self::from_query(q, q.dist_q_c)
+    }
+}
+
+impl FlatQueryParams {
+    pub(crate) fn from_query(q: &Query, dist_q_c: f32) -> Self {
+        Self {
+            lower_bound: q.lower_bound,
+            upper_bound: q.upper_bound,
+            dist_q_c,
+            approx_mode: q.approx_mode,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_candidates_with_scratch(
+    query: ArrayRef,
+    candidate_limit: usize,
+    params: &FlatQueryParams,
+    storage: &impl VectorStore,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: &dyn MetricsCollector,
+    residual: Option<QueryResidual<'_>>,
+    scratch: &mut QueryScratch,
+) -> Result<BinaryHeap<OrderedNode<(u32, u64)>>> {
+    if storage.len() > u32::MAX as usize {
+        return Err(Error::index(format!(
+            "flat partition contains {} rows, exceeding the u32 local-offset limit",
+            storage.len()
+        )));
+    }
+
+    let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
+    let row_ids = storage.row_ids();
+    let dist_calc = storage.dist_calculator_with_scratch(
+        query,
+        params.dist_q_c,
+        residual,
+        &mut scratch.query_f32,
+        DistanceCalculatorOptions {
+            approx_mode: params.approx_mode,
+        },
+    );
+    let mut candidates = BinaryHeap::with_capacity(candidate_limit);
+    metrics.record_comparisons(storage.len());
+
+    if prefilter.is_empty() {
+        dist_calc.distance_all_with_scratch(
+            candidate_limit,
+            &mut scratch.distances,
+            &mut scratch.u16,
+            &mut scratch.u8,
+            &mut scratch.u32,
+        );
+        let distances = scratch.distances.iter().copied();
+        if is_range_query {
+            let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
+            let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
+            for (offset, (&row_id, distance)) in row_ids.zip(distances).enumerate() {
+                let distance = distance.into();
+                if distance < lower_bound || distance >= upper_bound {
+                    continue;
+                }
+                push_candidate_local(
+                    &mut candidates,
+                    candidate_limit,
+                    (offset as u32, row_id),
+                    distance,
+                );
+            }
+        } else {
+            for (offset, (&row_id, distance)) in row_ids.zip(distances).enumerate() {
+                push_candidate_local(
+                    &mut candidates,
+                    candidate_limit,
+                    (offset as u32, row_id),
+                    distance.into(),
+                );
+            }
+        }
+    } else {
+        prefilter
+            .mask()
+            .selected_offsets_into(row_ids, &mut scratch.u32);
+        if is_range_query {
+            let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
+            let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
+            for &offset in &scratch.u32 {
+                let distance = dist_calc.distance(offset).into();
+                if distance < lower_bound || distance >= upper_bound {
+                    continue;
+                }
+                push_candidate_local(
+                    &mut candidates,
+                    candidate_limit,
+                    (offset, storage.row_id(offset)),
+                    distance,
+                );
+            }
+        } else {
+            for &offset in &scratch.u32 {
+                push_candidate_local(
+                    &mut candidates,
+                    candidate_limit,
+                    (offset, storage.row_id(offset)),
+                    dist_calc.distance(offset).into(),
+                );
+            }
+        }
+    }
+
+    Ok(candidates)
+}
+
+impl IvfSubIndex for FlatIndex {
+    type QueryParams = FlatQueryParams;
+    type BuildParams = ();
+
+    fn query_params(query: &Query, _query_key: &ArrayRef, dist_q_c: f32) -> Self::QueryParams {
+        Self::QueryParams::from_query(query, dist_q_c)
+    }
+
+    fn name() -> &'static str {
+        "FLAT"
+    }
+
+    fn metadata_key() -> &'static str {
+        "lance:flat"
+    }
+
+    fn schema() -> arrow_schema::SchemaRef {
+        FLAT_SCHEMA.clone()
+    }
+
+    fn search(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: Self::QueryParams,
+        storage: &impl VectorStore,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        let mut scratch = QueryScratch::new();
+        self.search_with_scratch(
+            query,
+            k,
+            params,
+            storage,
+            prefilter,
+            metrics,
+            None,
+            &mut scratch,
+        )
+    }
+
+    fn search_with_scratch(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: Self::QueryParams,
+        storage: &impl VectorStore,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+        residual: Option<QueryResidual<'_>>,
+        scratch: &mut QueryScratch,
+    ) -> Result<RecordBatch> {
+        let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
+        let row_ids = storage.row_ids();
+        let query_timer = IndexTimer::new(metrics, IndexTiming::QueryPrepare);
+        let dist_calc = storage.dist_calculator_with_scratch(
+            query,
+            params.dist_q_c,
+            residual,
+            &mut scratch.query_f32,
+            DistanceCalculatorOptions {
+                approx_mode: params.approx_mode,
+            },
+        );
+        drop(query_timer);
+        let mut res = BinaryHeap::with_capacity(k);
+        metrics.record_comparisons(storage.len());
+        // Filtering, distance evaluation and heap updates are fused in fast-scan paths.
+        let distance_timer = IndexTimer::new(metrics, IndexTiming::DistanceTopK);
+
+        match prefilter.is_empty() {
+            // The calculator certifies that its top-k scan keeps every row the
+            // push below would, so it can skip scoring most rows.
+            true if storage.len() > k.saturating_mul(MIN_ROWS_PER_RESULT_FOR_TOPK_SCAN)
+                && dist_calc.has_exact_topk_scan() =>
+            {
+                dist_calc.accumulate_topk_with_scratch(
+                    k,
+                    params.lower_bound,
+                    params.upper_bound,
+                    |id| storage.row_id(id),
+                    &mut res,
+                    &mut scratch.distances,
+                    &mut scratch.u16,
+                    &mut scratch.u8,
+                    &mut scratch.u32,
+                );
+            }
+            true => {
+                dist_calc.distance_all_with_scratch(
+                    k,
+                    &mut scratch.distances,
+                    &mut scratch.u16,
+                    &mut scratch.u8,
+                    &mut scratch.u32,
+                );
+                let dists = scratch.distances.iter().copied();
+
+                if is_range_query {
+                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
+                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
+
+                    for (&row_id, dist) in row_ids.zip(dists) {
+                        let dist = dist.into();
+                        if dist < lower_bound || dist >= upper_bound {
+                            continue;
+                        }
+                        push_candidate_local(&mut res, k, row_id, dist);
+                    }
+                } else {
+                    for (&row_id, dist) in row_ids.zip(dists) {
+                        let dist = dist.into();
+                        push_candidate_local(&mut res, k, row_id, dist);
+                    }
+                }
+            }
+            false => {
+                prefilter
+                    .mask()
+                    .selected_offsets_into(row_ids, &mut scratch.u32);
+                if is_range_query {
+                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
+                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
+                    for &id in &scratch.u32 {
+                        let dist = dist_calc.distance(id).into();
+                        if dist < lower_bound || dist >= upper_bound {
+                            continue;
+                        }
+                        push_candidate_local(&mut res, k, storage.row_id(id), dist);
+                    }
+                } else {
+                    for &id in &scratch.u32 {
+                        let dist = dist_calc.distance(id).into();
+                        push_candidate_local(&mut res, k, storage.row_id(id), dist);
+                    }
+                }
+            }
+        };
+
+        drop(distance_timer);
+        let _result_timer = IndexTimer::new(metrics, IndexTiming::ResultMaterialize);
+        // we don't need to sort the results by distances here
+        // because there's a SortExec node in the query plan which sorts the results from all partitions
+        let (row_ids, dists): (Vec<_>, Vec<_>) = res
+            .into_iter()
+            .map(|candidate| (candidate.id, candidate.dist.0))
+            .unzip();
+        let (row_ids, dists) = (UInt64Array::from(row_ids), Float32Array::from(dists));
+
+        Ok(RecordBatch::try_new(
+            ANN_SEARCH_SCHEMA.clone(),
+            vec![Arc::new(dists), Arc::new(row_ids)],
+        )?)
+    }
+
+    fn search_with_candidates_with_scratch(
+        &self,
+        query: ArrayRef,
+        candidate_limit: usize,
+        params: Self::QueryParams,
+        storage: &impl VectorStore,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+        partition_id: u32,
+        residual: Option<QueryResidual<'_>>,
+        scratch: &mut QueryScratch,
+    ) -> Result<PartitionSearchResult> {
+        let results = search_candidates_with_scratch(
+            query,
+            candidate_limit,
+            &params,
+            storage,
+            prefilter,
+            metrics,
+            residual,
+            scratch,
+        )?;
+        let mut candidates = Vec::with_capacity(results.len());
+        let mut row_ids = Vec::with_capacity(results.len());
+        let mut distances = Vec::with_capacity(results.len());
+        for result in results {
+            candidates.push(PartitionSearchCandidate {
+                partition_id,
+                offset_in_partition: result.id.0,
+            });
+            row_ids.push(result.id.1);
+            distances.push(result.dist.0);
+        }
+        let batch = RecordBatch::try_new(
+            ANN_SEARCH_SCHEMA.clone(),
+            vec![
+                Arc::new(Float32Array::from(distances)),
+                Arc::new(UInt64Array::from(row_ids)),
+            ],
+        )?;
+        Ok(PartitionSearchResult { batch, candidates })
+    }
+
+    fn supports_global_topk_heap() -> bool {
+        true
+    }
+
+    fn accumulate_topk(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: Self::QueryParams,
+        storage: &impl VectorStore,
+        prefilter: Arc<dyn PreFilter>,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        let mut scratch = QueryScratch::new();
+        self.accumulate_topk_with_scratch(
+            query,
+            k,
+            params,
+            storage,
+            prefilter,
+            res,
+            None,
+            &mut scratch,
+            metrics,
+        )
+    }
+
+    fn accumulate_topk_with_scratch(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: Self::QueryParams,
+        storage: &impl VectorStore,
+        prefilter: Arc<dyn PreFilter>,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        residual: Option<QueryResidual<'_>>,
+        scratch: &mut QueryScratch,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        let row_ids = storage.row_ids();
+        let query_timer = IndexTimer::new(metrics, IndexTiming::QueryPrepare);
+        let dist_calc = storage.dist_calculator_with_scratch(
+            query,
+            params.dist_q_c,
+            residual,
+            &mut scratch.query_f32,
+            DistanceCalculatorOptions {
+                approx_mode: params.approx_mode,
+            },
+        );
+        drop(query_timer);
+        metrics.record_comparisons(storage.len());
+        // Filtering, distance evaluation and heap updates are fused in fast-scan paths.
+        let distance_timer = IndexTimer::new(metrics, IndexTiming::DistanceTopK);
+
+        match prefilter.is_empty() {
+            true => {
+                dist_calc.accumulate_topk_with_scratch(
+                    k,
+                    params.lower_bound,
+                    params.upper_bound,
+                    |id| storage.row_id(id),
+                    res,
+                    &mut scratch.distances,
+                    &mut scratch.u16,
+                    &mut scratch.u8,
+                    &mut scratch.u32,
+                );
+            }
+            false => {
+                // The selection and the calculator's candidate buffer share the
+                // u32 scratch: take it for the selection and keep the larger of
+                // the two afterwards.
+                prefilter
+                    .mask()
+                    .selected_offsets_into(row_ids, &mut scratch.u32);
+                let selected = std::mem::take(&mut scratch.u32);
+                dist_calc.accumulate_filtered_topk_with_scratch(
+                    k,
+                    params.lower_bound,
+                    params.upper_bound,
+                    selected.iter().map(|&id| (id, storage.row_id(id))),
+                    |_| true,
+                    res,
+                    &mut scratch.distances,
+                    &mut scratch.u16,
+                    &mut scratch.u8,
+                    &mut scratch.u32,
+                );
+                if selected.capacity() > scratch.u32.capacity() {
+                    scratch.u32 = selected;
+                }
+            }
+        };
+        drop(distance_timer);
+        Ok(())
+    }
+
+    fn load(_: RecordBatch) -> Result<Self> {
+        Ok(Self {})
+    }
+
+    fn index_vectors(_: &impl VectorStore, _: Self::BuildParams) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(Self {})
+    }
+
+    fn remap(&self, _: &RowAddrRemap, _: &impl VectorStore) -> Result<Self> {
+        Ok(self.clone())
+    }
+
+    fn to_batch(&self) -> Result<RecordBatch> {
+        Ok(RecordBatch::new_empty(Schema::empty().into()))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
+pub struct FlatMetadata {
+    pub dim: usize,
+}
+
+#[async_trait::async_trait]
+impl QuantizerMetadata for FlatMetadata {
+    async fn load(_: &V1FileReader) -> Result<Self> {
+        unimplemented!("Flat will be used in new index builder which doesn't require this")
+    }
+}
+
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct FlatQuantizer {
+    dim: usize,
+    distance_type: DistanceType,
+}
+
+impl FlatQuantizer {
+    pub fn new(dim: usize, distance_type: DistanceType) -> Self {
+        Self { dim, distance_type }
+    }
+}
+
+impl Quantization for FlatQuantizer {
+    type BuildParams = ();
+    type Metadata = FlatMetadata;
+    type Storage = FlatFloatStorage;
+
+    fn build(data: &dyn Array, distance_type: DistanceType, _: &Self::BuildParams) -> Result<Self> {
+        let dim = data.as_fixed_size_list().value_length();
+        Ok(Self::new(dim as usize, distance_type))
+    }
+
+    fn retrain(&mut self, _: &dyn Array) -> Result<()> {
+        Ok(())
+    }
+
+    fn code_dim(&self) -> usize {
+        self.dim
+    }
+
+    fn column(&self) -> &'static str {
+        FLAT_COLUMN
+    }
+
+    fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
+        Ok(Quantizer::Flat(Self {
+            dim: metadata.dim,
+            distance_type,
+        }))
+    }
+
+    fn metadata(&self, _: Option<crate::vector::quantizer::QuantizationMetadata>) -> FlatMetadata {
+        FlatMetadata { dim: self.dim }
+    }
+
+    fn metadata_key() -> &'static str {
+        "flat"
+    }
+
+    fn quantization_type() -> QuantizationType {
+        QuantizationType::Flat
+    }
+
+    fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
+        Ok(vectors.slice(0, vectors.len()))
+    }
+
+    fn field(&self) -> Field {
+        Field::new(
+            FLAT_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                self.dim as i32,
+            ),
+            true,
+        )
+    }
+}
+
+impl From<FlatQuantizer> for Quantizer {
+    fn from(value: FlatQuantizer) -> Self {
+        Self::Flat(value)
+    }
+}
+
+impl TryFrom<Quantizer> for FlatQuantizer {
+    type Error = Error;
+
+    fn try_from(value: Quantizer) -> Result<Self> {
+        match value {
+            Quantizer::Flat(quantizer) => Ok(quantizer),
+            _ => Err(Error::invalid_input("quantizer is not FlatQuantizer")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct FlatBinQuantizer {
+    dim: usize,
+    distance_type: DistanceType,
+}
+
+impl FlatBinQuantizer {
+    pub fn new(dim: usize, distance_type: DistanceType) -> Self {
+        Self { dim, distance_type }
+    }
+}
+
+impl Quantization for FlatBinQuantizer {
+    type BuildParams = ();
+    type Metadata = FlatMetadata;
+    type Storage = FlatBinStorage;
+
+    fn build(data: &dyn Array, distance_type: DistanceType, _: &Self::BuildParams) -> Result<Self> {
+        let dim = data.as_fixed_size_list().value_length();
+        Ok(Self::new(dim as usize, distance_type))
+    }
+
+    fn retrain(&mut self, _: &dyn Array) -> Result<()> {
+        Ok(())
+    }
+
+    fn code_dim(&self) -> usize {
+        self.dim
+    }
+
+    fn column(&self) -> &'static str {
+        FLAT_COLUMN
+    }
+
+    fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
+        Ok(Quantizer::FlatBin(Self {
+            dim: metadata.dim,
+            distance_type,
+        }))
+    }
+
+    fn metadata(&self, _: Option<crate::vector::quantizer::QuantizationMetadata>) -> FlatMetadata {
+        FlatMetadata { dim: self.dim }
+    }
+
+    fn metadata_key() -> &'static str {
+        "flat"
+    }
+
+    fn quantization_type() -> QuantizationType {
+        QuantizationType::FlatBin
+    }
+
+    fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
+        Ok(vectors.slice(0, vectors.len()))
+    }
+
+    fn field(&self) -> Field {
+        Field::new(
+            FLAT_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                self.dim as i32,
+            ),
+            true,
+        )
+    }
+}
+
+impl From<FlatBinQuantizer> for Quantizer {
+    fn from(value: FlatBinQuantizer) -> Self {
+        Self::FlatBin(value)
+    }
+}
+
+impl TryFrom<Quantizer> for FlatBinQuantizer {
+    type Error = Error;
+
+    fn try_from(value: Quantizer) -> Result<Self> {
+        match value {
+            Quantizer::FlatBin(quantizer) => Ok(quantizer),
+            _ => Err(Error::invalid_input("quantizer is not FlatBinQuantizer")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_array::FixedSizeListArray;
+    use async_trait::async_trait;
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_select::{RowAddrMask, RowAddrTreeMap};
+
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::prefilter::NoFilter;
+
+    #[test]
+    fn test_schema_is_initialized_once() {
+        // The subindex schema is requested per call, so it is shared rather
+        // than rebuilt. Pointer equality is what distinguishes a shared schema
+        // from an equal-but-freshly-allocated one.
+        assert!(Arc::ptr_eq(&FlatIndex::schema(), &FlatIndex::schema()));
+        assert_eq!(FlatIndex::schema().field(0).name(), "__flat_marker");
+    }
+
+    struct MaskPreFilter {
+        mask: Arc<RowAddrMask>,
+    }
+
+    #[async_trait]
+    impl PreFilter for MaskPreFilter {
+        async fn wait_for_ready(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_empty(&self) -> bool {
+            false
+        }
+
+        fn mask(&self) -> Arc<RowAddrMask> {
+            self.mask.clone()
+        }
+
+        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+            self.mask.selected_indices(row_ids)
+        }
+    }
+
+    fn test_storage() -> FlatFloatStorage {
+        let values = Float32Array::from(vec![
+            0.0, 0.0, // row 0
+            1.0, 0.0, // row 1
+            1.0, 1.0, // row 2
+            3.0, 3.0, // row 3
+            4.0, 4.0, // row 4
+        ]);
+        let vectors = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        FlatFloatStorage::new(vectors, DistanceType::L2)
+    }
+
+    fn query() -> ArrayRef {
+        Arc::new(Float32Array::from(vec![1.0, 1.0]))
+    }
+
+    fn batch_results(batch: RecordBatch) -> Vec<(u64, f32)> {
+        let dists = batch
+            .column(0)
+            .as_primitive::<arrow_array::types::Float32Type>();
+        let row_ids = batch
+            .column(1)
+            .as_primitive::<arrow_array::types::UInt64Type>();
+        let mut results = row_ids
+            .values()
+            .iter()
+            .zip(dists.values().iter())
+            .map(|(row_id, dist)| (*row_id, *dist))
+            .collect::<Vec<_>>();
+        results.sort_by_key(|left| left.0);
+        results
+    }
+
+    fn heap_results(heap: BinaryHeap<OrderedNode<u64>>) -> Vec<(u64, f32)> {
+        let mut results = heap
+            .into_iter()
+            .map(|node| (node.id, node.dist.0))
+            .collect::<Vec<_>>();
+        results.sort_by_key(|left| left.0);
+        results
+    }
+
+    #[test]
+    fn test_flat_search_matches_accumulate_topk_without_prefilter() {
+        let index = FlatIndex::default();
+        let storage = test_storage();
+        let k = 3;
+        let search_results = batch_results(
+            index
+                .search(
+                    query(),
+                    k,
+                    FlatQueryParams::default(),
+                    &storage,
+                    Arc::new(NoFilter),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap(),
+        );
+
+        let mut heap = BinaryHeap::with_capacity(k);
+        index
+            .accumulate_topk(
+                query(),
+                k,
+                FlatQueryParams::default(),
+                &storage,
+                Arc::new(NoFilter),
+                &mut heap,
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert_eq!(search_results, heap_results(heap));
+    }
+
+    #[test]
+    fn test_flat_search_matches_accumulate_topk_with_prefilter() {
+        let index = FlatIndex::default();
+        let storage = test_storage();
+        let k = 2;
+        let filter = Arc::new(MaskPreFilter {
+            mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+                0_u64, 3, 4,
+            ]))),
+        });
+        let search_results = batch_results(
+            index
+                .search(
+                    query(),
+                    k,
+                    FlatQueryParams::default(),
+                    &storage,
+                    filter.clone(),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap(),
+        );
+
+        let mut heap = BinaryHeap::with_capacity(k);
+        index
+            .accumulate_topk(
+                query(),
+                k,
+                FlatQueryParams::default(),
+                &storage,
+                filter,
+                &mut heap,
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert_eq!(search_results, heap_results(heap));
+        assert_eq!(
+            search_results.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![0, 3]
+        );
+    }
+
+    #[test]
+    fn test_flat_candidate_search_preserves_partition_offsets() {
+        let index = FlatIndex::default();
+        let storage = test_storage();
+        let mut scratch = QueryScratch::new();
+        let result = index
+            .search_with_candidates_with_scratch(
+                query(),
+                3,
+                FlatQueryParams::default(),
+                &storage,
+                Arc::new(NoFilter),
+                &NoOpMetricsCollector,
+                7,
+                None,
+                &mut scratch,
+            )
+            .unwrap();
+
+        assert_eq!(result.batch.num_rows(), result.candidates.len());
+        let row_ids =
+            result.batch[lance_core::ROW_ID].as_primitive::<arrow_array::types::UInt64Type>();
+        for (&row_id, candidate) in row_ids.values().iter().zip(&result.candidates) {
+            assert_eq!(candidate.partition_id, 7);
+            assert_eq!(row_id, candidate.offset_in_partition as u64);
+        }
+    }
+}

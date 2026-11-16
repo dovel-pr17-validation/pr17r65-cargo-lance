@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Routines for encoding and decoding full-zip data
+//!
+//! Full-zip is one of the two structural encodings in Lance 2.1.
+//! In this approach the various compressed buffers are zipped
+//! together so that all parts of a value are stored contiguously in memory.
+//!
+//! This requires transparent compression and is most suitable for
+//! large data types.
+
+use std::sync::Arc;
+
+use crate::{
+    data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
+    format::metadata::CompressiveEncoding,
+};
+
+use arrow_buffer::BooleanBuffer;
+use futures::{FutureExt, future::BoxFuture};
+use lance_core::Result;
+use lance_core::utils::tokio::spawn_cpu;
+
+/// Per-value compression must either:
+///
+/// A single buffer of fixed-width values
+/// A single buffer of value data and a buffer of offsets
+///
+/// TODO: In the future we may allow metadata buffers
+#[derive(Debug)]
+pub enum PerValueDataBlock {
+    Fixed(FixedWidthDataBlock),
+    Variable(VariableWidthBlock),
+}
+
+impl PerValueDataBlock {
+    pub fn data_size(&self) -> u64 {
+        match self {
+            Self::Fixed(fixed) => fixed.data_size(),
+            Self::Variable(variable) => variable.data_size(),
+        }
+    }
+}
+
+/// Trait for compression algorithms that are suitable for use in the zipped structural encoding
+///
+/// This compression must return either a FixedWidthDataBlock or a VariableWidthBlock.  This is because
+/// we need to zip the data and those are the only two blocks we know how to zip today.
+///
+/// In addition, the compressed data must be able to be decompressed in a random-access fashion.
+/// This means that the decompression algorithm must be able to decompress any value without
+/// decompressing all values before it.
+pub trait PerValueCompressor: std::fmt::Debug + Send + Sync {
+    /// Compress the data into a single buffer
+    ///
+    /// Also returns a description of the compression that can be used to decompress when reading the data back
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)>;
+
+    /// Whether selection needs the structural validity of materialized tensor slots.
+    fn needs_row_validity(&self) -> bool {
+        false
+    }
+
+    /// Compress with an optional valid-row bitmap for sampling. Validity remains
+    /// owned by the structural encoder and is not part of the value payload.
+    fn compress_with_validity(
+        &self,
+        data: DataBlock,
+        _validity: Option<&BooleanBuffer>,
+    ) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
+        self.compress(data)
+    }
+
+    /// Asynchronous counterpart of [`Self::compress_with_validity`].
+    ///
+    /// The default implementation runs the existing synchronous compressor on
+    /// the CPU pool. Implementations that can fan out internally may override
+    /// this method, but must keep the synchronous method above available for
+    /// callers that do not have an async context.
+    #[doc(hidden)]
+    fn compress_with_validity_async(
+        self: Arc<Self>,
+        data: DataBlock,
+        validity: Option<BooleanBuffer>,
+    ) -> BoxFuture<'static, Result<(PerValueDataBlock, CompressiveEncoding)>>
+    where
+        Self: 'static,
+    {
+        async move { spawn_cpu(move || self.compress_with_validity(data, validity.as_ref())).await }
+            .boxed()
+    }
+}

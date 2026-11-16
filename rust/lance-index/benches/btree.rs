@@ -1,0 +1,1124 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Benchmark of BTree scalar index.
+//!
+//! This benchmark measures the performance of BTree index with:
+//! - 50 million data points
+//! - int and String data types
+//! - High cardinality (unique values) and low cardinality (100 unique values)
+//! - Equality filters
+//! - Range filters with varying selectivity (few/many/most rows match)
+//! - IN filters with varying size (10, 20, 30 values)
+//! - Key lookups with varying batch size (1000, 8192 keys), sorted or random
+//! - Range filters over pages whose row ids span many fragments
+//! - Ordered search: time to the first 100 rows in key order
+//! - Filter planning per column and as a tuple query over composite keys
+
+mod common;
+
+use std::{
+    cell::OnceCell,
+    collections::HashMap,
+    ops::Bound,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
+
+use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
+use std::hint::black_box;
+
+use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Fields, SortOptions};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use datafusion_common::ScalarValue;
+use datafusion_expr::{Expr, col, lit};
+use futures::TryStreamExt;
+use lance_core::cache::LanceCache;
+use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::pbold;
+use lance_index::scalar::btree::{BTreeIndexPlugin, DEFAULT_BTREE_BATCH_SIZE, train_btree_index};
+use lance_index::scalar::expression::{
+    IndexInformationProvider, MultiQueryParser, SargableQueryParser, apply_scalar_indices,
+};
+use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::registry::ScalarIndexPlugin;
+use lance_index::scalar::tuple::planner::plan_tuple_predicate;
+use lance_index::scalar::{AnyQuery, SargableQuery, ScalarIndex};
+use lance_io::object_store::ObjectStore;
+#[cfg(target_os = "linux")]
+use lance_testing::pprof::{Output, PProfProfiler};
+use object_store::path::Path;
+use rand::{Rng, SeedableRng, rngs::SmallRng};
+
+/// Selectivity level for range queries
+#[derive(Clone, Copy, Debug)]
+enum Selectivity {
+    Few,  // ~0.1% of rows
+    Many, // ~10% of rows
+    Most, // ~90% of rows
+}
+
+impl Selectivity {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Few => "few",
+            Self::Many => "many",
+            Self::Most => "most",
+        }
+    }
+
+    /// Get the approximate percentage of rows that should match
+    fn percentage(&self) -> f64 {
+        match self {
+            Self::Few => 0.001,
+            Self::Many => 0.10,
+            Self::Most => 0.90,
+        }
+    }
+}
+
+// Lazy static runtime - only created once
+static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+// Lazy static cache - only created when cached benchmarks are run
+static CACHE: OnceLock<Arc<LanceCache>> = OnceLock::new();
+
+// Lazy static indices - only created when first accessed
+// Separate indices for cached and uncached variants
+static INT_UNIQUE_INDEX_NO_CACHE: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static INT_UNIQUE_INDEX_CACHED: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static INT_LOW_CARD_INDEX_NO_CACHE: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static INT_LOW_CARD_INDEX_CACHED: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static STRING_UNIQUE_INDEX_NO_CACHE: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static STRING_UNIQUE_INDEX_CACHED: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static STRING_LOW_CARD_INDEX_NO_CACHE: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static STRING_LOW_CARD_INDEX_CACHED: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static INT_MANY_FRAG_INDEX_NO_CACHE: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static INT_MANY_FRAG_INDEX_CACHED: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+
+// Keep temp directories alive for the lifetime of the program
+static TEMP_DIRS: OnceLock<Vec<tempfile::TempDir>> = OnceLock::new();
+
+/// Get or create the tokio runtime
+fn get_runtime() -> &'static tokio::runtime::Runtime {
+    RUNTIME.get_or_init(|| tokio::runtime::Builder::new_multi_thread().build().unwrap())
+}
+
+/// Get the cache - either a singleton cache or no_cache based on use_cache parameter
+fn get_cache(use_cache: bool, key_prefix: &str) -> Arc<LanceCache> {
+    if use_cache {
+        Arc::new(
+            CACHE
+                .get_or_init(|| Arc::new(LanceCache::with_capacity(1024 * 1024 * 1024)))
+                .with_key_prefix(key_prefix),
+        )
+    } else {
+        Arc::new(LanceCache::no_cache())
+    }
+}
+
+/// Create and train a BTree index for int64 data with unique values
+async fn create_int_unique_index(
+    store: Arc<LanceIndexStore>,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
+    let stream = common::generate_int_unique_stream();
+
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
+        .await
+        .unwrap();
+
+    let cache = get_cache(use_cache, "int_unique");
+    let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
+
+    (BTreeIndexPlugin
+        .load_index(
+            store,
+            &details,
+            lance_index::scalar::btree::BTREE_INDEX_VERSION,
+            None,
+            &cache,
+        )
+        .await
+        .unwrap()) as _
+}
+
+/// Create and train a BTree index for int64 data with low cardinality
+async fn create_int_low_card_index(
+    store: Arc<LanceIndexStore>,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
+    let stream = common::generate_int_low_cardinality_stream();
+
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
+        .await
+        .unwrap();
+
+    let cache = get_cache(use_cache, "int_low_card");
+    let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
+
+    (BTreeIndexPlugin
+        .load_index(
+            store,
+            &details,
+            lance_index::scalar::btree::BTREE_INDEX_VERSION,
+            None,
+            &cache,
+        )
+        .await
+        .unwrap()) as _
+}
+
+/// Create and train a BTree index for string data with unique values
+async fn create_string_unique_index(
+    store: Arc<LanceIndexStore>,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
+    let stream = common::generate_string_unique_stream();
+
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
+        .await
+        .unwrap();
+
+    let cache = get_cache(use_cache, "string_unique");
+    let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
+
+    (BTreeIndexPlugin
+        .load_index(
+            store,
+            &details,
+            lance_index::scalar::btree::BTREE_INDEX_VERSION,
+            None,
+            &cache,
+        )
+        .await
+        .unwrap()) as _
+}
+
+/// Create and train a BTree index for string data with low cardinality
+async fn create_string_low_card_index(
+    store: Arc<LanceIndexStore>,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
+    let stream = common::generate_string_low_cardinality_stream();
+
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
+        .await
+        .unwrap();
+
+    let cache = get_cache(use_cache, "string_low_card");
+    let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
+
+    (BTreeIndexPlugin
+        .load_index(
+            store,
+            &details,
+            lance_index::scalar::btree::BTREE_INDEX_VERSION,
+            None,
+            &cache,
+        )
+        .await
+        .unwrap()) as _
+}
+
+/// Create and train a BTree index for int64 data whose row ids are spread
+/// across many fragments (each page spans every fragment)
+async fn create_int_many_fragment_index(
+    store: Arc<LanceIndexStore>,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
+    let stream = common::generate_int_many_fragment_stream();
+
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
+        .await
+        .unwrap();
+
+    let cache = get_cache(use_cache, "int_many_frag");
+    let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
+
+    (BTreeIndexPlugin
+        .load_index(store, &details, 0, None, &cache)
+        .await
+        .unwrap()) as _
+}
+
+/// Setup function for int many-fragment index - creates it only once per cache variant
+fn setup_int_many_fragment_index(
+    rt: &tokio::runtime::Runtime,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
+    let static_ref = if use_cache {
+        &INT_MANY_FRAG_INDEX_CACHED
+    } else {
+        &INT_MANY_FRAG_INDEX_NO_CACHE
+    };
+
+    static_ref
+        .get_or_init(|| {
+            rt.block_on(async {
+                let tempdir = tempfile::tempdir().unwrap();
+                let store = Arc::new(LanceIndexStore::new(
+                    Arc::new(ObjectStore::local()),
+                    Path::from_filesystem_path(tempdir.path()).unwrap(),
+                    get_cache(use_cache, "int_many_frag"),
+                ));
+                let index = create_int_many_fragment_index(store, use_cache).await;
+                let _ = tempdir.keep();
+                index
+            })
+        })
+        .clone()
+}
+
+/// Setup function for int unique index - creates it only once per cache variant
+fn setup_int_unique_index(rt: &tokio::runtime::Runtime, use_cache: bool) -> Arc<dyn ScalarIndex> {
+    let static_ref = if use_cache {
+        &INT_UNIQUE_INDEX_CACHED
+    } else {
+        &INT_UNIQUE_INDEX_NO_CACHE
+    };
+
+    static_ref
+        .get_or_init(|| {
+            rt.block_on(async {
+                let tempdir = tempfile::tempdir().unwrap();
+                let store = Arc::new(LanceIndexStore::new(
+                    Arc::new(ObjectStore::local()),
+                    Path::from_filesystem_path(tempdir.path()).unwrap(),
+                    get_cache(use_cache, "int_unique"),
+                ));
+                let index = create_int_unique_index(store, use_cache).await;
+
+                // Store the temp directory to keep it alive
+                TEMP_DIRS.get_or_init(Vec::new);
+                // Note: We can't modify TEMP_DIRS after init, but the tempdir staying in scope here
+                // should keep it alive for the program duration due to the static lifetime
+                let _ = tempdir.keep();
+
+                index
+            })
+        })
+        .clone()
+}
+
+/// Setup function for int low cardinality index - creates it only once per cache variant
+fn setup_int_low_card_index(rt: &tokio::runtime::Runtime, use_cache: bool) -> Arc<dyn ScalarIndex> {
+    let static_ref = if use_cache {
+        &INT_LOW_CARD_INDEX_CACHED
+    } else {
+        &INT_LOW_CARD_INDEX_NO_CACHE
+    };
+
+    static_ref
+        .get_or_init(|| {
+            rt.block_on(async {
+                let tempdir = tempfile::tempdir().unwrap();
+                let store = Arc::new(LanceIndexStore::new(
+                    Arc::new(ObjectStore::local()),
+                    Path::from_filesystem_path(tempdir.path()).unwrap(),
+                    get_cache(use_cache, "int_low_card"),
+                ));
+                let index = create_int_low_card_index(store, use_cache).await;
+                let _ = tempdir.keep();
+                index
+            })
+        })
+        .clone()
+}
+
+/// Setup function for string unique index - creates it only once per cache variant
+fn setup_string_unique_index(
+    rt: &tokio::runtime::Runtime,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
+    let static_ref = if use_cache {
+        &STRING_UNIQUE_INDEX_CACHED
+    } else {
+        &STRING_UNIQUE_INDEX_NO_CACHE
+    };
+
+    static_ref
+        .get_or_init(|| {
+            rt.block_on(async {
+                let tempdir = tempfile::tempdir().unwrap();
+                let store = Arc::new(LanceIndexStore::new(
+                    Arc::new(ObjectStore::local()),
+                    Path::from_filesystem_path(tempdir.path()).unwrap(),
+                    get_cache(use_cache, "string_unique"),
+                ));
+                let index = create_string_unique_index(store, use_cache).await;
+                let _ = tempdir.keep();
+                index
+            })
+        })
+        .clone()
+}
+
+/// Setup function for string low cardinality index - creates it only once per cache variant
+fn setup_string_low_card_index(
+    rt: &tokio::runtime::Runtime,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
+    let static_ref = if use_cache {
+        &STRING_LOW_CARD_INDEX_CACHED
+    } else {
+        &STRING_LOW_CARD_INDEX_NO_CACHE
+    };
+
+    static_ref
+        .get_or_init(|| {
+            rt.block_on(async {
+                let tempdir = tempfile::tempdir().unwrap();
+                let store = Arc::new(LanceIndexStore::new(
+                    Arc::new(ObjectStore::local()),
+                    Path::from_filesystem_path(tempdir.path()).unwrap(),
+                    get_cache(use_cache, "string_low_card"),
+                ));
+                let index = create_string_low_card_index(store, use_cache).await;
+                let _ = tempdir.keep();
+                index
+            })
+        })
+        .clone()
+}
+
+fn bench_equality(c: &mut Criterion) {
+    let rt = get_runtime();
+
+    // Calculate test values from constants (middle of range)
+    let int_unique_value = (TOTAL_ROWS / 2) as i64;
+    let string_unique_value = format!("string_{:010}", TOTAL_ROWS / 2);
+    let int_low_card_value = (LOW_CARDINALITY_COUNT / 2) as i64;
+    let string_low_card_value = format!("value_{:03}", LOW_CARDINALITY_COUNT / 2);
+
+    let mut group = c.benchmark_group("btree_equality");
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(10));
+
+    // Benchmark both cached and uncached variants
+    for use_cache in [false, true] {
+        let cache_label = if use_cache { "cached" } else { "no_cache" };
+
+        // int unique
+        group.bench_function(BenchmarkId::new("int_unique", cache_label), |b| {
+            let index = setup_int_unique_index(rt, use_cache);
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                let value = int_unique_value;
+                async move {
+                    let query = SargableQuery::Equals(ScalarValue::Int64(Some(value)));
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
+
+        // int low cardinality
+        group.bench_function(BenchmarkId::new("int_low_card", cache_label), |b| {
+            let index = setup_int_low_card_index(rt, use_cache);
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                let value = int_low_card_value;
+                async move {
+                    let query = SargableQuery::Equals(ScalarValue::Int64(Some(value)));
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
+
+        // String unique
+        group.bench_function(BenchmarkId::new("string_unique", cache_label), |b| {
+            let index = setup_string_unique_index(rt, use_cache);
+            let value = string_unique_value.clone();
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                let value = value.clone();
+                async move {
+                    let query = SargableQuery::Equals(ScalarValue::Utf8(Some(value)));
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
+
+        // String low cardinality
+        group.bench_function(BenchmarkId::new("string_low_card", cache_label), |b| {
+            let index = setup_string_low_card_index(rt, use_cache);
+            let value = string_low_card_value.clone();
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                let value = value.clone();
+                async move {
+                    let query = SargableQuery::Equals(ScalarValue::Utf8(Some(value)));
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
+    }
+
+    group.finish();
+}
+
+/// Helper function to count results from a range query
+fn count_range_results(
+    rt: &tokio::runtime::Runtime,
+    index: &Arc<dyn ScalarIndex>,
+    query: SargableQuery,
+) -> usize {
+    rt.block_on(async {
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        match result {
+            lance_index::scalar::SearchResult::Exact(row_ids) => {
+                row_ids.len().expect("Expected exact row count") as usize
+            }
+            _ => panic!("Expected exact search result"),
+        }
+    })
+}
+
+fn bench_range(c: &mut Criterion, selectivity: Selectivity) {
+    let rt = get_runtime();
+
+    let group_name = format!("btree_range_{}", selectivity.name());
+    let mut group = c.benchmark_group(&group_name);
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(10));
+
+    let pct = selectivity.percentage();
+
+    // Int unique - range queries
+    let int_range_size = (TOTAL_ROWS as f64 * pct) as u64;
+    let int_start = (TOTAL_ROWS / 2) - (int_range_size / 2);
+    let int_end = int_start + int_range_size;
+
+    // Benchmark both cached and uncached variants
+    for use_cache in [false, true] {
+        let cache_label = if use_cache { "cached" } else { "no_cache" };
+
+        group.bench_function(BenchmarkId::new("int_unique", cache_label), |b| {
+            // Setup index and run sanity check
+            let index = setup_int_unique_index(rt, use_cache);
+
+            // Sanity check: verify int unique range returns expected count
+            let int_unique_query = SargableQuery::Range(
+                Bound::Included(ScalarValue::Int64(Some(int_start as i64))),
+                Bound::Included(ScalarValue::Int64(Some(int_end as i64))),
+            );
+            let int_unique_count = count_range_results(rt, &index, int_unique_query);
+            let expected_count = (int_end - int_start + 1) as usize; // +1 because range is inclusive
+            assert!(
+                (int_unique_count as f64 - expected_count as f64).abs() / (expected_count as f64)
+                    < 0.01,
+                "int unique count mismatch: expected {}, got {}",
+                expected_count,
+                int_unique_count
+            );
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                async move {
+                    let query = SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(int_start as i64))),
+                        Bound::Included(ScalarValue::Int64(Some(int_end as i64))),
+                    );
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
+
+        // int low cardinality - range queries
+        // With 100 unique values, select appropriate range
+        let low_card_range_size = (LOW_CARDINALITY_COUNT as f64 * pct) as usize;
+        let low_card_start = (LOW_CARDINALITY_COUNT / 2) - (low_card_range_size / 2);
+        let low_card_end = low_card_start + low_card_range_size;
+
+        group.bench_function(BenchmarkId::new("int_low_card", cache_label), |b| {
+            // Setup index and run sanity check
+            let index = setup_int_low_card_index(rt, use_cache);
+
+            // Sanity check: verify int low cardinality range returns expected count
+            let int_low_card_query = SargableQuery::Range(
+                Bound::Included(ScalarValue::Int64(Some(low_card_start as i64))),
+                Bound::Included(ScalarValue::Int64(Some(low_card_end as i64))),
+            );
+            let int_low_card_count = count_range_results(rt, &index, int_low_card_query);
+            let rows_per_value = TOTAL_ROWS / LOW_CARDINALITY_COUNT as u64;
+            let expected_low_card_count =
+                ((low_card_end - low_card_start + 1) as u64 * rows_per_value) as usize;
+            assert!(
+                (int_low_card_count as f64 - expected_low_card_count as f64).abs()
+                    / (expected_low_card_count as f64)
+                    < 0.01,
+                "int low cardinality count mismatch: expected {}, got {}",
+                expected_low_card_count,
+                int_low_card_count
+            );
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                async move {
+                    let query = SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(low_card_start as i64))),
+                        Bound::Included(ScalarValue::Int64(Some(low_card_end as i64))),
+                    );
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
+
+        // String unique - range queries
+        let string_start_row = int_start;
+        let string_end_row = int_end;
+
+        group.bench_function(BenchmarkId::new("string_unique", cache_label), |b| {
+            // Setup index and run sanity check
+            let index = setup_string_unique_index(rt, use_cache);
+
+            // Sanity check: verify string unique range returns expected count
+            let string_unique_query = SargableQuery::Range(
+                Bound::Included(ScalarValue::Utf8(Some(format!(
+                    "string_{:010}",
+                    string_start_row
+                )))),
+                Bound::Included(ScalarValue::Utf8(Some(format!(
+                    "string_{:010}",
+                    string_end_row
+                )))),
+            );
+            let string_unique_count = count_range_results(rt, &index, string_unique_query);
+            let expected_string_count = (string_end_row - string_start_row + 1) as usize;
+            assert!(
+                (string_unique_count as f64 - expected_string_count as f64).abs()
+                    / (expected_string_count as f64)
+                    < 0.01,
+                "String unique count mismatch: expected {}, got {}",
+                expected_string_count,
+                string_unique_count
+            );
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                async move {
+                    let query = SargableQuery::Range(
+                        Bound::Included(ScalarValue::Utf8(Some(format!(
+                            "string_{:010}",
+                            string_start_row
+                        )))),
+                        Bound::Included(ScalarValue::Utf8(Some(format!(
+                            "string_{:010}",
+                            string_end_row
+                        )))),
+                    );
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
+
+        // String low cardinality - range queries
+        group.bench_function(BenchmarkId::new("string_low_card", cache_label), |b| {
+            // Setup index and run sanity check
+            let index = setup_string_low_card_index(rt, use_cache);
+
+            // Sanity check: verify string low cardinality range returns expected count
+            let string_low_card_query = SargableQuery::Range(
+                Bound::Included(ScalarValue::Utf8(Some(format!(
+                    "value_{:03}",
+                    low_card_start
+                )))),
+                Bound::Included(ScalarValue::Utf8(Some(format!(
+                    "value_{:03}",
+                    low_card_end
+                )))),
+            );
+            let string_low_card_count = count_range_results(rt, &index, string_low_card_query);
+            let rows_per_value = TOTAL_ROWS / LOW_CARDINALITY_COUNT as u64;
+            let expected_string_low_card_count =
+                ((low_card_end - low_card_start + 1) as u64 * rows_per_value) as usize;
+            assert!(
+                (string_low_card_count as f64 - expected_string_low_card_count as f64).abs()
+                    / (expected_string_low_card_count as f64)
+                    < 0.01,
+                "String low cardinality count mismatch: expected {}, got {}",
+                expected_string_low_card_count,
+                string_low_card_count
+            );
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                async move {
+                    let query = SargableQuery::Range(
+                        Bound::Included(ScalarValue::Utf8(Some(format!(
+                            "value_{:03}",
+                            low_card_start
+                        )))),
+                        Bound::Included(ScalarValue::Utf8(Some(format!(
+                            "value_{:03}",
+                            low_card_end
+                        )))),
+                    );
+                    black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                }
+            })
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_in(c: &mut Criterion) {
+    let rt = get_runtime();
+
+    // Test with different numbers of values in the IN clause
+    let value_counts = [10, 20, 30];
+
+    for &num_values in &value_counts {
+        let mut group = c.benchmark_group(format!("btree_in_{}", num_values));
+        group
+            .sample_size(10)
+            .measurement_time(Duration::from_secs(10));
+
+        // Calculate values around the middle of the range
+        let mid_int = (TOTAL_ROWS / 2) as i64;
+        let mid_string = TOTAL_ROWS / 2;
+        let mid_low_card = LOW_CARDINALITY_COUNT / 2;
+
+        // Int unique - IN query
+        let int_values: Vec<ScalarValue> = (0..num_values)
+            .map(|i| ScalarValue::Int64(Some(mid_int + i as i64 - num_values as i64 / 2)))
+            .collect();
+
+        // Int low cardinality - IN query
+        let int_low_card_values: Vec<ScalarValue> = (0..num_values)
+            .map(|i| ScalarValue::Int64(Some((mid_low_card + i - num_values / 2) as i64)))
+            .collect();
+
+        // String unique - IN query
+        let string_values: Vec<ScalarValue> = (0..num_values)
+            .map(|i| {
+                ScalarValue::Utf8(Some(format!(
+                    "string_{:010}",
+                    (mid_string as i64 + i as i64 - num_values as i64 / 2) as u64
+                )))
+            })
+            .collect();
+
+        // String low cardinality - IN query
+        let string_low_card_values: Vec<ScalarValue> = (0..num_values)
+            .map(|i| {
+                ScalarValue::Utf8(Some(format!(
+                    "value_{:03}",
+                    (mid_low_card as i32 + i as i32 - num_values as i32 / 2) as usize
+                )))
+            })
+            .collect();
+
+        // Benchmark both cached and uncached variants
+        for use_cache in [false, true] {
+            let cache_label = if use_cache { "cached" } else { "no_cache" };
+
+            group.bench_function(BenchmarkId::new("int_unique", cache_label), |b| {
+                let index = setup_int_unique_index(rt, use_cache);
+                let values = int_values.clone();
+                b.to_async(rt).iter(|| {
+                    let index = index.clone();
+                    let values = values.clone();
+                    async move {
+                        let query = SargableQuery::IsIn(values);
+                        black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                    }
+                })
+            });
+
+            group.bench_function(BenchmarkId::new("int_low_card", cache_label), |b| {
+                let index = setup_int_low_card_index(rt, use_cache);
+                let values = int_low_card_values.clone();
+                b.to_async(rt).iter(|| {
+                    let index = index.clone();
+                    let values = values.clone();
+                    async move {
+                        let query = SargableQuery::IsIn(values);
+                        black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                    }
+                })
+            });
+
+            group.bench_function(BenchmarkId::new("string_unique", cache_label), |b| {
+                let index = setup_string_unique_index(rt, use_cache);
+                let values = string_values.clone();
+                b.to_async(rt).iter(|| {
+                    let index = index.clone();
+                    let values = values.clone();
+                    async move {
+                        let query = SargableQuery::IsIn(values);
+                        black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                    }
+                })
+            });
+
+            group.bench_function(BenchmarkId::new("string_low_card", cache_label), |b| {
+                let index = setup_string_low_card_index(rt, use_cache);
+                let values = string_low_card_values.clone();
+                b.to_async(rt).iter(|| {
+                    let index = index.clone();
+                    let values = values.clone();
+                    async move {
+                        let query = SargableQuery::IsIn(values);
+                        black_box(index.search(&query, &NoOpMetricsCollector).await.unwrap());
+                    }
+                })
+            });
+        }
+
+        group.finish();
+    }
+}
+
+/// Keys for a lookup benchmark: a contiguous run around the middle of the
+/// range (touches few pages) or values drawn uniformly at random (touches
+/// pages across the whole index).
+fn lookup_keys(num_keys: usize, random: bool) -> Vec<u64> {
+    if random {
+        let mut rng = SmallRng::seed_from_u64(42);
+        (0..num_keys)
+            .map(|_| rng.random_range(0..TOTAL_ROWS))
+            .collect()
+    } else {
+        let start = TOTAL_ROWS / 2 - num_keys as u64 / 2;
+        (start..start + num_keys as u64).collect()
+    }
+}
+
+fn bench_lookup(c: &mut Criterion) {
+    let rt = get_runtime();
+
+    for num_keys in [1_000, 8_192] {
+        let mut group = c.benchmark_group(format!("btree_lookup_{num_keys}"));
+        group
+            .sample_size(10)
+            .measurement_time(Duration::from_secs(10));
+
+        for random in [false, true] {
+            let order = if random { "random" } else { "sorted" };
+            let keys = lookup_keys(num_keys, random);
+            let int_keys: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                keys.iter().map(|&key| key as i64),
+            ));
+            let string_keys: ArrayRef = Arc::new(StringArray::from_iter_values(
+                keys.iter().map(|key| format!("string_{key:010}")),
+            ));
+
+            for use_cache in [false, true] {
+                let cache_label = if use_cache { "cached" } else { "no_cache" };
+
+                for (name, index, keys) in [
+                    (
+                        "int_unique",
+                        setup_int_unique_index(rt, use_cache),
+                        &int_keys,
+                    ),
+                    (
+                        "string_unique",
+                        setup_string_unique_index(rt, use_cache),
+                        &string_keys,
+                    ),
+                ] {
+                    let id = BenchmarkId::new(format!("{name}_{order}"), cache_label);
+                    group.bench_function(id, |b| {
+                        b.to_async(rt).iter(|| {
+                            let index = index.clone();
+                            let keys = keys.clone();
+                            async move {
+                                let matches: Vec<RecordBatch> = index
+                                    .lookup(keys, &NoOpMetricsCollector)
+                                    .unwrap()
+                                    .try_collect()
+                                    .await
+                                    .unwrap();
+                                let num_matches: usize =
+                                    matches.iter().map(RecordBatch::num_rows).sum();
+                                assert_eq!(num_matches, num_keys);
+                                black_box(matches);
+                            }
+                        })
+                    });
+                }
+            }
+        }
+
+        group.finish();
+    }
+}
+
+/// Range queries over an index whose pages each span all `NUM_FRAGMENTS`
+/// fragments: the result has to be assembled from `pages x fragments`
+/// (page, fragment) pieces, which is where per-page result construction
+/// used to dominate.
+fn bench_range_many_fragments(c: &mut Criterion) {
+    let rt = get_runtime();
+    let total_rows = common::many_fragment_total_rows();
+
+    let mut group = c.benchmark_group("btree_range_many_fragments");
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(10));
+
+    for selectivity in [Selectivity::Few, Selectivity::Many, Selectivity::Most] {
+        let range_size = (total_rows as f64 * selectivity.percentage()) as u64;
+        let start = (total_rows / 2) - (range_size / 2);
+        let end = start + range_size;
+        let make_query = move || {
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Int64(Some(start as i64))),
+                Bound::Included(ScalarValue::Int64(Some(end as i64))),
+            )
+        };
+
+        for use_cache in [false, true] {
+            let cache_label = if use_cache { "cached" } else { "no_cache" };
+            let id = BenchmarkId::new(format!("int_{}", selectivity.name()), cache_label);
+            group.bench_function(id, |b| {
+                let index = setup_int_many_fragment_index(rt, use_cache);
+
+                // Sanity check: every row in [start, end] must come back,
+                // spread over all fragments.
+                let count = count_range_results(rt, &index, make_query());
+                let expected = (end - start + 1) as usize;
+                assert_eq!(
+                    count, expected,
+                    "many-fragment range count mismatch: expected {expected}, got {count}"
+                );
+
+                b.to_async(rt).iter(|| {
+                    let index = index.clone();
+                    async move {
+                        black_box(
+                            index
+                                .search(&make_query(), &NoOpMetricsCollector)
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                })
+            });
+        }
+    }
+
+    group.finish();
+}
+
+const ORDERED_FIRST_K: usize = 100;
+
+async fn ordered_first_k(
+    index: &Arc<dyn ScalarIndex>,
+    query: Option<&SargableQuery>,
+    options: SortOptions,
+) -> usize {
+    let mut stream = index
+        .as_ordered()
+        .unwrap()
+        .search_ordered(
+            query.map(|query| query as &dyn AnyQuery),
+            options,
+            Arc::new(NoOpMetricsCollector),
+        )
+        .unwrap();
+    let mut rows = 0;
+    while rows < ORDERED_FIRST_K {
+        match stream.try_next().await.unwrap() {
+            Some(batch) => rows += batch.num_rows(),
+            None => break,
+        }
+    }
+    rows.min(ORDERED_FIRST_K)
+}
+
+async fn create_int_unique_row_addr_index(tempdir: &tempfile::TempDir) -> Arc<dyn ScalarIndex> {
+    let stream = common::generate_int_unique_stream();
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(ObjectStore::local()),
+        Path::from_filesystem_path(tempdir.path()).unwrap(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
+        .await
+        .unwrap();
+    let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
+    BTreeIndexPlugin
+        .load_index(
+            store,
+            &details,
+            lance_index::scalar::btree::BTREE_INDEX_VERSION,
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Ordered search reads pages lazily, so this times the first page, not the
+/// whole index.
+fn bench_ordered_first_k(c: &mut Criterion) {
+    let rt = get_runtime();
+    let tempdir = tempfile::tempdir().unwrap();
+    let lazy_index = OnceCell::new();
+    let index = || {
+        lazy_index
+            .get_or_init(|| rt.block_on(create_int_unique_row_addr_index(&tempdir)))
+            .clone()
+    };
+    let range_size = TOTAL_ROWS / 100;
+    let start = (TOTAL_ROWS - range_size) / 2;
+    let range = SargableQuery::Range(
+        Bound::Included(ScalarValue::Int64(Some(start as i64))),
+        Bound::Excluded(ScalarValue::Int64(Some((start + range_size) as i64))),
+    );
+    let ascending = SortOptions {
+        descending: false,
+        nulls_first: true,
+    };
+    let descending = SortOptions {
+        descending: true,
+        nulls_first: false,
+    };
+
+    let mut group = c.benchmark_group("btree_ordered_first_k");
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(10));
+    for (name, query, options) in [
+        ("all_rows_asc", None, ascending),
+        ("all_rows_desc", None, descending),
+        ("range_1pct_asc", Some(&range), ascending),
+    ] {
+        group.bench_function(BenchmarkId::new("int_unique", name), |b| {
+            let index = index();
+            assert_eq!(
+                rt.block_on(ordered_first_k(&index, query, options)),
+                ORDERED_FIRST_K,
+                "{name} yielded fewer than {ORDERED_FIRST_K} rows"
+            );
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                async move { black_box(ordered_first_k(&index, query, options).await) }
+            })
+        });
+    }
+    group.finish();
+}
+
+fn bench_btree(c: &mut Criterion) {
+    // Run equality benchmarks
+    bench_equality(c);
+
+    // Run IN query benchmarks
+    bench_in(c);
+
+    // Run key lookup benchmarks
+    bench_lookup(c);
+
+    // Run range benchmarks with different selectivities
+    bench_range(c, Selectivity::Few);
+    bench_range(c, Selectivity::Many);
+    bench_range(c, Selectivity::Most);
+
+    // Run range benchmarks over pages that span many fragments
+    bench_range_many_fragments(c);
+
+    bench_ordered_first_k(c);
+}
+
+struct BTreeColumns(HashMap<String, (DataType, MultiQueryParser)>);
+
+impl IndexInformationProvider for BTreeColumns {
+    fn get_index(&self, col: &str) -> Option<(&DataType, &MultiQueryParser)> {
+        self.0
+            .get(col)
+            .map(|(data_type, parser)| (data_type, parser))
+    }
+}
+
+fn bench_tuple_planning(c: &mut Criterion) {
+    let fields = [
+        Field::new("tenant", DataType::Int32, true),
+        Field::new("ts", DataType::Int64, true),
+        Field::new("kind", DataType::Utf8, true),
+        Field::new("status", DataType::Utf8, true),
+        Field::new("score", DataType::Float64, true),
+        Field::new("region", DataType::Utf8, true),
+    ];
+    let keys = Fields::from(fields[..3].to_vec());
+    let indices = BTreeColumns(
+        fields
+            .iter()
+            .map(|field| {
+                let parser = SargableQueryParser::new(
+                    format!("{}_idx", field.name()),
+                    "BTree".into(),
+                    false,
+                );
+                (
+                    field.name().clone(),
+                    (
+                        field.data_type().clone(),
+                        MultiQueryParser::single(Box::new(parser)),
+                    ),
+                )
+            })
+            .collect(),
+    );
+    let conjuncts = [
+        col("tenant").in_list(vec![lit(1), lit(2), lit(3)], false),
+        col("ts").gt_eq(lit(10_i64)),
+        col("ts").lt(lit(20_i64)),
+        col("kind").eq(lit("x")),
+        col("status").eq(lit("a")),
+        col("score").gt(lit(0.5)),
+        col("region").in_list(vec![lit("us"), lit("eu")], false),
+        (col("ts") % lit(7_i64)).eq(lit(0_i64)),
+        col("tenant").is_not_null(),
+        col("status").is_not_null(),
+    ];
+    let predicate = conjuncts.iter().cloned().reduce(Expr::and).unwrap();
+    let cross_product = [
+        col("tenant").in_list((0..64).map(lit).collect(), false),
+        col("ts").in_list((0..128_i64).map(lit).collect(), false),
+    ];
+
+    let mut group = c.benchmark_group("tuple_planning");
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(10));
+    group.bench_function("per_column_parse/10_conjuncts", |b| {
+        b.iter_batched(
+            || predicate.clone(),
+            |predicate| black_box(apply_scalar_indices(predicate, &indices).unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("tuple_plan/10_conjuncts", |b| {
+        b.iter(|| black_box(plan_tuple_predicate(&conjuncts, &keys).unwrap()))
+    });
+    group.bench_function("tuple_plan/8192_tuples", |b| {
+        b.iter(|| black_box(plan_tuple_predicate(&cross_product, &keys).unwrap()))
+    });
+    group.finish();
+}
+
+#[cfg(target_os = "linux")]
+criterion_group!(
+    name=benches;
+    config = Criterion::default()
+        .measurement_time(Duration::from_secs(10))
+        .sample_size(10)
+        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    targets = bench_btree);
+
+// Non-linux version does not support pprof.
+#[cfg(not(target_os = "linux"))]
+criterion_group!(
+    name=benches;
+    config = Criterion::default()
+        .measurement_time(Duration::from_secs(10))
+        .sample_size(10);
+    targets = bench_btree);
+
+criterion_group!(tuple_planning, bench_tuple_planning);
+
+criterion_main!(benches, tuple_planning);

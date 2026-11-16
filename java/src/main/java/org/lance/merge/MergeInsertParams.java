@@ -1,0 +1,582 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.lance.merge;
+
+import org.lance.DataStorageVersion;
+import org.lance.memwal.CompactedSsTable;
+import org.lance.memwal.MemWalIndexDetails;
+
+import com.google.common.base.MoreObjects;
+import com.google.common.base.Preconditions;
+
+import java.nio.ByteBuffer;
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+
+public class MergeInsertParams {
+  private final List<String> on;
+
+  private WhenMatched whenMatched = WhenMatched.DoNothing;
+  private Optional<String> whenMatchedUpdateExpr = Optional.empty();
+
+  private WhenNotMatched whenNotMatched = WhenNotMatched.InsertAll;
+
+  private WhenNotMatchedBySource whenNotMatchedBySource = WhenNotMatchedBySource.Keep;
+  private Optional<String> whenNotMatchedBySourceDeleteExpr = Optional.empty();
+  private Optional<ByteBuffer> whenNotMatchedBySourceDeleteSubstraitExpr = Optional.empty();
+
+  private int conflictRetries = 10;
+  private long retryTimeoutMs = 30 * 1000;
+  private boolean skipAutoCleanup = false;
+  private boolean useIndex = true;
+  private Optional<DataStorageVersion> dataStorageVersion = Optional.empty();
+  private MergeWriteMode writeMode = MergeWriteMode.Auto;
+  private List<CompactedSsTable> compactedSstables = Collections.emptyList();
+  private Optional<String> memWalDirId = Optional.empty();
+  private SourceDedupeBehavior sourceDedupeBehavior = SourceDedupeBehavior.Fail;
+
+  public MergeInsertParams(List<String> on) {
+    this.on = on;
+  }
+
+  /**
+   * Specify that when a row in the source table matches a row in the target table, the row is
+   * deleted from the target table and the matched row based on the source table is inserted.
+   *
+   * <p>This can be used to achieve upsert behavior.
+   *
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withMatchedUpdateAll() {
+    this.whenMatched = WhenMatched.UpdateAll;
+    return this;
+  }
+
+  /**
+   * Specify that when a row in the source table matches a row in the target table, the row in the
+   * target table is kept unchanged.
+   *
+   * <p>This can be used to achieve find-or-create behavior.
+   *
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withMatchedDoNothing() {
+    this.whenMatched = WhenMatched.DoNothing;
+    return this;
+  }
+
+  /**
+   * Specify that when a row in the source table matches a row in the target table, the row in the
+   * target table is deleted.
+   *
+   * <p>This can be used to achieve "when matched delete" behavior.
+   *
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withMatchedDelete() {
+    this.whenMatched = WhenMatched.Delete;
+    return this;
+  }
+
+  /**
+   * Specify that when a row in the source table matches a row in the target table and the
+   * expression evaluates to true, the row in the target table is updated by the matched row from
+   * the source table.
+   *
+   * <p>This can be used to achieve upsert behavior.
+   *
+   * <p>The expression can reference source tables' columns with <code>source.</code> and target
+   * tables' columns with <code>target.</code> This is an example: <code>
+   * source.column1 = target.column1 AND source.column2 = target.column2</code>
+   *
+   * @param expr The expression to evaluate on the rows in the source table and target table.
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withMatchedUpdateIf(String expr) {
+    Preconditions.checkNotNull(expr);
+    this.whenMatched = WhenMatched.UpdateIf;
+    this.whenMatchedUpdateExpr = Optional.of(expr);
+    return this;
+  }
+
+  /**
+   * Specify that when a row in the source table matches a row in the target table, the entire merge
+   * operation will fail with an error.
+   *
+   * <p>This can be used to ensure that no existing rows are overwritten or modified after inserted.
+   *
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withMatchedFail() {
+    this.whenMatched = WhenMatched.Fail;
+    return this;
+  }
+
+  /**
+   * Specify what should happen when a source row has no match in the target.
+   *
+   * @param whenNotMatched The action to take when a source row has no match in the target.
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withNotMatched(WhenNotMatched whenNotMatched) {
+    this.whenNotMatched = whenNotMatched;
+    return this;
+  }
+
+  /**
+   * Specify that when a target row has no match in the source, the row is kept in the target table.
+   *
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withNotMatchedBySourceKeep() {
+    this.whenNotMatchedBySource = WhenNotMatchedBySource.Keep;
+    return this;
+  }
+
+  /**
+   * Specify that when a target row has no match in the source, the row is deleted from the target
+   * table.
+   *
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withNotMatchedBySourceDelete() {
+    this.whenNotMatchedBySource = WhenNotMatchedBySource.Delete;
+    return this;
+  }
+
+  /**
+   * Specify that when a target row has no match in the source and the expression evaluates to true,
+   * the row is deleted from the target table.
+   *
+   * @param expr The sql expression to evaluate on the rows in the target table.
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withNotMatchedBySourceDeleteIf(String expr) {
+    Preconditions.checkNotNull(expr);
+    this.whenNotMatchedBySource = WhenNotMatchedBySource.DeleteIf;
+    this.whenNotMatchedBySourceDeleteExpr = Optional.of(expr);
+    this.whenNotMatchedBySourceDeleteSubstraitExpr = Optional.empty();
+    return this;
+  }
+
+  /**
+   * Specify that when a target row has no match in the source and the expression evaluates to true,
+   * the row is deleted from the target table.
+   *
+   * @param expr The substrait expression to evaluate on the rows in the target table.
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withNotMatchedBySourceDeleteSubstraitIf(ByteBuffer expr) {
+    Preconditions.checkNotNull(expr);
+    this.whenNotMatchedBySource = WhenNotMatchedBySource.DeleteIf;
+    this.whenNotMatchedBySourceDeleteExpr = Optional.empty();
+    this.whenNotMatchedBySourceDeleteSubstraitExpr = Optional.of(expr);
+    return this;
+  }
+
+  /**
+   * Set number of times to retry the operation if there is contention.
+   *
+   * <p>If this is set greater than 0, then the operation will keep a copy of the input data either
+   * in memory or on disk (depending on the size of the data) and will retry the operation if there
+   * is contention.
+   *
+   * <p>Default is 10.
+   *
+   * @param retries Number of times to retry the operation if there is contention.
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withConflictRetries(int retries) {
+    this.conflictRetries = retries;
+    return this;
+  }
+
+  /**
+   * Set the timeout in milliseconds used to limit retries.
+   *
+   * <p>This is the maximum time to spend on the operation before giving up. At least one attempt
+   * will be made, regardless of how long it takes to complete. Subsequent attempts will be
+   * cancelled once this timeout is reached. If the timeout has been reached during the first
+   * attempt, the operation will be cancelled immediately.
+   *
+   * <p>Default is 30000.
+   *
+   * @param timeoutMs Timeout in milliseconds used to limit retries.
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withRetryTimeoutMs(long timeoutMs) {
+    this.retryTimeoutMs = timeoutMs;
+    return this;
+  }
+
+  /**
+   * If true, skip auto cleanup during commits. This should be set to true for high frequency writes
+   * to improve performance. This is also useful if the writer does not have delete permissions and
+   * the clean up would just try and log a failure anyway.
+   *
+   * @param skipAutoCleanup Whether to skip auto cleanup during commits.
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withSkipAutoCleanup(boolean skipAutoCleanup) {
+    this.skipAutoCleanup = skipAutoCleanup;
+    return this;
+  }
+
+  /**
+   * Controls whether to use indices for the merge operation.
+   *
+   * <p>When set to false, forces a full table scan even if an index exists on the join key. This
+   * can be useful for benchmarking or when the optimizer chooses a suboptimal path.
+   *
+   * <p>Default is true (use index if available).
+   *
+   * @param useIndex Whether to use indices for the merge join
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withUseIndex(boolean useIndex) {
+    this.useIndex = useIndex;
+    return this;
+  }
+
+  /**
+   * Set the exact data storage version for files written by this operation.
+   *
+   * <p>If omitted, the dataset's default write version is used without changing it. Release
+   * selectors are resolved by the engine. V1/V2 cross-family targets are rejected.
+   */
+  public MergeInsertParams withDataStorageVersion(DataStorageVersion version) {
+    this.dataStorageVersion = Optional.of(Preconditions.checkNotNull(version));
+    return this;
+  }
+
+  /**
+   * Selects how the merged rows are written.
+   *
+   * <p>Only has an effect on a partial-schema update (the source omits some dataset columns), where
+   * {@link MergeWriteMode#RewriteColumns} writes fewer bytes than {@link
+   * MergeWriteMode#RewriteRows} once the fraction of rows matched exceeds roughly the fraction of
+   * each row's bytes the source columns occupy: nearly always for a KB-scale update of a MB-per-row
+   * table, possibly never for a table of narrow columns.
+   *
+   * <p>Default is {@link MergeWriteMode#Auto}: the write mode is chosen by the engine, typically
+   * rewriting whole rows.
+   *
+   * @param writeMode How the merged rows are written.
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withWriteMode(MergeWriteMode writeMode) {
+    Preconditions.checkNotNull(writeMode, "writeMode must not be null");
+    this.writeMode = writeMode;
+    return this;
+  }
+
+  /**
+   * Control how duplicate source rows are handled.
+   *
+   * <p>Default is {@link SourceDedupeBehavior#Fail}, which errors only when multiple source rows
+   * match the <em>same target row</em> (an ambiguous update or delete). It does <b>not</b> reject
+   * duplicate join keys among unmatched rows — those are all inserted. Use {@link
+   * SourceDedupeBehavior#FirstSeen} to keep the first row for each join key and skip subsequent
+   * duplicates, including unmatched rows that would otherwise insert the same non-null key more
+   * than once.
+   *
+   * <p>Rows whose join keys contain NULL are never duplicates, because merge insert uses SQL
+   * equality where NULL does not equal NULL.
+   *
+   * <p>If the source contains duplicates and {@code FirstSeen} behavior doesn't match your needs,
+   * sort the source data before passing it to the merge insert operation.
+   *
+   * @param sourceDedupeBehavior The behavior to apply when duplicate source rows are found
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withSourceDedupeBehavior(SourceDedupeBehavior sourceDedupeBehavior) {
+    Preconditions.checkNotNull(sourceDedupeBehavior);
+    this.sourceDedupeBehavior = sourceDedupeBehavior;
+    return this;
+  }
+
+  /**
+   * Mark MemWAL SSTables as compacted into the base table.
+   *
+   * <p>Use this when merge insert compacts MemWAL SSTables. It updates MemWAL compaction progress
+   * to prevent the same SSTables from being compacted again, in the same commit as the data.
+   *
+   * <p><b>For multi-pass compaction, call this only on the final successful data-changing pass.</b>
+   * Intermediate passes must not carry compaction progress. Lance cannot tell whether a caller has
+   * another pass planned, so it cannot enforce this: if a delete pass carried the marker and the
+   * process then died before the matching upsert, the recorded progress would claim rows were
+   * copied in that never were.
+   *
+   * <p>The commit fails if the table's MemWAL has since been disabled or replaced. Pass an empty
+   * {@code sstables} on the passes that record no progress, so they are checked too.
+   *
+   * @param dirId the {@link MemWalIndexDetails#dirId() dirId} of the MemWAL the SSTables belong to
+   * @param sstables the SSTables being compacted
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams markSstablesAsCompacted(String dirId, List<CompactedSsTable> sstables) {
+    Preconditions.checkNotNull(dirId, "dirId must not be null");
+    Preconditions.checkNotNull(sstables, "sstables must not be null");
+    this.memWalDirId = Optional.of(dirId);
+    this.compactedSstables = sstables;
+    return this;
+  }
+
+  /**
+   * Mark SSTables of a MemWAL without a {@code dirId} as compacted.
+   *
+   * @deprecated Use {@link #markSstablesAsCompacted(String, List)}, which names the MemWAL the
+   *     SSTables belong to.
+   */
+  @Deprecated
+  public MergeInsertParams markSstablesAsCompacted(List<CompactedSsTable> sstables) {
+    return markSstablesAsCompacted("", sstables);
+  }
+
+  public List<String> on() {
+    return on;
+  }
+
+  public List<CompactedSsTable> getCompactedSstables() {
+    return compactedSstables;
+  }
+
+  /** The {@code dirId} passed to {@link #markSstablesAsCompacted(String, List)}, if any. */
+  public Optional<String> getMemWalDirId() {
+    return memWalDirId;
+  }
+
+  public WhenMatched whenMatched() {
+    return whenMatched;
+  }
+
+  public String whenMatchedValue() {
+    return whenMatched.name();
+  }
+
+  public Optional<String> whenMatchedUpdateExpr() {
+    return whenMatchedUpdateExpr;
+  }
+
+  public WhenNotMatched whenNotMatched() {
+    return whenNotMatched;
+  }
+
+  public String whenNotMatchedValue() {
+    return whenNotMatched.name();
+  }
+
+  public WhenNotMatchedBySource whenNotMatchedBySource() {
+    return whenNotMatchedBySource;
+  }
+
+  public String whenNotMatchedBySourceValue() {
+    return whenNotMatchedBySource.name();
+  }
+
+  public Optional<String> whenNotMatchedBySourceDeleteExpr() {
+    return whenNotMatchedBySourceDeleteExpr;
+  }
+
+  public Optional<ByteBuffer> whenNotMatchedBySourceDeleteSubstraitExpr() {
+    return whenNotMatchedBySourceDeleteSubstraitExpr;
+  }
+
+  public int conflictRetries() {
+    return conflictRetries;
+  }
+
+  public long retryTimeoutMs() {
+    return retryTimeoutMs;
+  }
+
+  public boolean skipAutoCleanup() {
+    return skipAutoCleanup;
+  }
+
+  public boolean useIndex() {
+    return useIndex;
+  }
+
+  public SourceDedupeBehavior getSourceDedupeBehavior() {
+    return sourceDedupeBehavior;
+  }
+
+  public String sourceDedupeBehaviorValue() {
+    return sourceDedupeBehavior.toRustString();
+  }
+
+  /** Returns the version selector as its string value for the native layer. */
+  public Optional<String> getDataStorageVersion() {
+    return dataStorageVersion.map(DataStorageVersion::toRustString);
+  }
+
+  public MergeWriteMode writeMode() {
+    return writeMode;
+  }
+
+  public String writeModeValue() {
+    return writeMode.name();
+  }
+
+  @Override
+  public String toString() {
+    return MoreObjects.toStringHelper(this)
+        .add("on", on)
+        .add("whenMatched", whenMatched)
+        .add("whenMatchedUpdateExpr", whenMatchedUpdateExpr.orElse(null))
+        .add("whenNotMatched", whenNotMatched)
+        .add("whenNotMatchedBySource", whenNotMatchedBySource)
+        .add("whenNotMatchedBySourceDeleteExpr", whenNotMatchedBySourceDeleteExpr.orElse(null))
+        .add(
+            "whenNotMatchedBySourceDeleteSubstraitExpr",
+            whenNotMatchedBySourceDeleteSubstraitExpr
+                .map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]")
+                .orElse(null))
+        .add("conflictRetries", conflictRetries)
+        .add("retryTimeoutMs", retryTimeoutMs)
+        .add("skipAutoCleanup", skipAutoCleanup)
+        .add("useIndex", useIndex)
+        .add("sourceDedupeBehavior", sourceDedupeBehavior)
+        .add("dataStorageVersion", dataStorageVersion.orElse(null))
+        .add("writeMode", writeMode)
+        .toString();
+  }
+
+  /**
+   * How a merge insert writes the merged rows.
+   *
+   * <p>The caller chooses rather than the engine because which mode writes fewer bytes depends on
+   * the fraction of each fragment's rows the source matches, which is only known once the join has
+   * run.
+   */
+  public enum MergeWriteMode {
+    /**
+     * Let the engine choose, typically rewriting whole rows. A partial-schema update whose join key
+     * carries a scalar index may instead patch columns on the indexed path that predates this enum.
+     */
+    Auto,
+
+    /**
+     * Delete the matched rows and write whole rows into new fragments. Cost scales with the number
+     * of matched rows.
+     *
+     * <p>For a partial-schema update this gives up the scalar-index probe on the join key, because
+     * the indexed path only ever patches columns.
+     */
+    RewriteRows,
+
+    /**
+     * Attach new data files holding the source columns to the fragments that already hold the
+     * matched rows, and tombstone the old versions of those columns. The omitted columns are
+     * neither read nor written, but the replacement column file covers every row of each fragment
+     * it touches, so the bytes written barely fall as fewer rows match.
+     *
+     * <p>Errors if the merge cannot be expressed this way: it must update matched rows only (no
+     * inserts, no matched deletes, no delete-by-source) with a source that omits at least one
+     * dataset column, carries at least one column besides the join key, and carries no blob column.
+     */
+    RewriteColumns,
+  }
+
+  public enum WhenMatched {
+    /**
+     * The row is deleted from the target table and a new row is inserted based on the source table.
+     * This can be used to achieve upsert behavior.
+     */
+    UpdateAll,
+
+    /** The row is kept unchanged. This can be used to achieve find-or-create behavior. */
+    DoNothing,
+
+    /**
+     * The row is updated (similar to UpdateAll) only for rows where the expression evaluates to
+     * true.
+     */
+    UpdateIf,
+
+    /**
+     * The operation will fail if a match is found between the source and target table. This can be
+     * used to ensure that no existing rows are overwritten or modified after inserted.
+     */
+    Fail,
+
+    /**
+     * The row is deleted from the target table when a row in the source table matches a row in the
+     * target table.
+     */
+    Delete
+  }
+
+  public enum WhenNotMatched {
+    /**
+     * The new row is inserted into the target table. This is used in both find-or-create and upsert
+     * operations
+     */
+    InsertAll,
+
+    /** The new row is ignored. */
+    DoNothing,
+  }
+
+  public enum WhenNotMatchedBySource {
+    /**
+     * Do not delete rows from the target table This can be used for a find-or-create or an upsert
+     * operation
+     */
+    Keep,
+
+    /** Delete all rows from target table that don't match a row in the source table */
+    Delete,
+
+    /**
+     * Delete rows from the target table if there is no match AND the expression evaluates to true
+     * This can be used to replace a region of data with new data
+     */
+    DeleteIf,
+  }
+
+  /**
+   * Describes how to handle duplicate source rows.
+   *
+   * <p>If the source contains duplicates and {@code FirstSeen} behavior doesn't match your needs,
+   * sort the source data before passing it to the merge insert operation. Rows whose join keys
+   * contain NULL are not duplicates because merge insert uses SQL equality, where NULL does not
+   * equal NULL.
+   */
+  public enum SourceDedupeBehavior {
+    /** Fail if multiple source rows match the same target row (default). */
+    Fail("Fail"),
+
+    /**
+     * Keep the first row for each join key and skip subsequent rows.
+     *
+     * <p>This applies both to rows that match a target row and to unmatched rows that would
+     * otherwise insert the same non-null join key more than once.
+     */
+    FirstSeen("FirstSeen");
+
+    private final String rustValue;
+
+    SourceDedupeBehavior(String rustValue) {
+      this.rustValue = rustValue;
+    }
+
+    /** Returns the canonical string used by the native layer. */
+    public String toRustString() {
+      return rustValue;
+    }
+  }
+}

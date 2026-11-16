@@ -1,0 +1,186 @@
+#  Copyright (c) 2023. Lance Developers
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
+from typing import Any, Dict, List, Optional
+
+from lance import LanceDataset
+from lance.fragment import FragmentMetadata
+
+from ..optimize import CompactionOptions
+
+class CompactionMetrics:
+    fragments_removed: int
+    fragments_added: int
+    files_removed: int
+    files_added: int
+
+class RewriteResult:
+    read_version: int
+    metrics: CompactionMetrics
+    original_fragments: List["FragmentMetadata"]
+    new_fragments: List["FragmentMetadata"]
+
+    def json(self) -> str:
+        """Get a JSON representation of the result.
+
+        Returns
+        -------
+        str
+
+        Warning
+        -------
+        The JSON representation is not guaranteed to be stable across versions.
+        """
+        ...
+
+    @staticmethod
+    def from_json(json: str) -> RewriteResult:
+        """Load a result from a JSON representation.
+
+        Parameters
+        ----------
+        json : str
+            The JSON representation of the result.
+
+        Returns
+        -------
+        RewriteResult
+        """
+        ...
+
+class CompactionTask:
+    read_version: int
+    fragments: List["FragmentMetadata"]
+
+    def execute(self, dataset: "LanceDataset") -> RewriteResult: ...
+    def json(self) -> str:
+        """Get a JSON representation of the task.
+
+        Returns
+        -------
+        str
+
+        Warning
+        -------
+        The JSON representation is not guaranteed to be stable across versions.
+        """
+        ...
+
+    @staticmethod
+    def from_json(json: str) -> CompactionTask:
+        """Load a task from a JSON representation.
+
+        Parameters
+        ----------
+        json : str
+            The JSON representation of the task.
+
+        Returns
+        -------
+        CompactionTask
+        """
+        ...
+
+class CompactionPlan:
+    read_version: int
+    tasks: List[CompactionTask]
+
+    def num_tasks(self) -> int: ...
+    def json(self) -> str:
+        """Get a JSON representation of the plan.
+
+        Returns
+        -------
+        str
+
+        Warning
+        -------
+        The JSON representation is not guaranteed to be stable across versions.
+        """
+        ...
+
+    @staticmethod
+    def from_json(json: str) -> CompactionPlan:
+        """Load a plan from a JSON representation.
+
+        Parameters
+        ----------
+        json : str
+            The JSON representation of the plan.
+
+        Returns
+        -------
+        CompactionPlan
+        """
+        ...
+
+class Compaction:
+    @staticmethod
+    def execute(
+        dataset: "LanceDataset", options: CompactionOptions
+    ) -> CompactionMetrics: ...
+    @staticmethod
+    def plan(dataset: "LanceDataset", options: CompactionOptions) -> CompactionPlan: ...
+    @staticmethod
+    def commit(
+        dataset: "LanceDataset",
+        rewrites: List[RewriteResult],
+        options: Optional[CompactionOptions] = None,
+    ) -> CompactionMetrics: ...
+
+class IndexSegmentResult:
+    group: int
+
+    def json(self) -> str: ...
+    @staticmethod
+    def from_json(json: str) -> IndexSegmentResult: ...
+
+class OptimizeIndexTask:
+    index_name: str
+    fragments: List[int]
+
+    def execute(self, dataset: "LanceDataset") -> Optional[IndexSegmentResult]: ...
+    def json(self) -> str: ...
+    @staticmethod
+    def from_json(json: str) -> OptimizeIndexTask: ...
+
+class OptimizeIndexMerge:
+    group: int
+
+    def execute(
+        self, dataset: "LanceDataset", task_results: List[Optional[IndexSegmentResult]]
+    ) -> Optional[IndexSegmentResult]: ...
+    def json(self) -> str: ...
+    @staticmethod
+    def from_json(json: str) -> OptimizeIndexMerge: ...
+
+class OptimizeIndicesPlan:
+    tasks: List[OptimizeIndexTask]
+    merges: List[OptimizeIndexMerge]
+
+    def json(self) -> str: ...
+    @staticmethod
+    def from_json(json: str) -> OptimizeIndicesPlan: ...
+
+class OptimizeIndices:
+    @staticmethod
+    def plan(
+        dataset: "LanceDataset", options: Optional[Dict[str, Any]] = None
+    ) -> OptimizeIndicesPlan: ...
+    @staticmethod
+    def commit(
+        dataset: "LanceDataset",
+        results: List[Optional[IndexSegmentResult]],
+        options: Optional[Dict[str, Any]] = None,
+    ) -> None: ...

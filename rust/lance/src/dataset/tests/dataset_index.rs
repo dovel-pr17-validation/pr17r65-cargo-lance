@@ -1,0 +1,10752 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+mod composition;
+
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use std::vec;
+
+use crate::dataset::ROW_ID;
+use crate::dataset::WriteDestination;
+use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::tests::dataset_migrations::scan_dataset;
+use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
+use crate::dataset::transaction::{DataReplacementGroup, Operation, Transaction};
+use crate::index::vector::VectorIndexParams;
+use crate::session::Session;
+use crate::utils::test::{copy_test_data_to_tmp, covering};
+use crate::{Dataset, Error, Result};
+use lance_arrow::FixedSizeListArrayExt;
+
+use crate::dataset::write::{WriteMode, WriteParams};
+use crate::index::scalar::load_scalar_segment_params;
+use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
+use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
+use arrow::datatypes::UInt64Type;
+use arrow_array::RecordBatch;
+use arrow_array::{
+    Array, BooleanArray, GenericStringArray, LargeListArray, ListArray, StructArray, UInt64Array,
+};
+use arrow_array::{
+    ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray,
+    builder::StringDictionaryBuilder,
+    types::{Float32Type, Int32Type, Int64Type},
+};
+use arrow_schema::{
+    DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
+};
+use lance_arrow::ARROW_EXT_NAME_KEY;
+use lance_core::cache::{
+    CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, LanceCache, QuickCacheBackend,
+};
+use lance_core::utils::tempfile::TempStrDir;
+use lance_datafusion::exec::{ExecutionSummaryCounts, LanceExecutionOptions, get_session_context};
+use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
+use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
+use lance_file::reader::{FileReader, FileReaderOptions};
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::optimize::OptimizeOptions;
+use lance_index::pb::VectorIndexDetails;
+use lance_index::scalar::btree::BTreeParameters;
+use lance_index::scalar::inverted::{
+    DocumentGranularity, InvertedIndex, InvertedListFormatVersion, SCORE_COL,
+    query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
+    tokenizer::InvertedIndexParams,
+};
+use lance_index::scalar::registry::StoreBoundScalarIndexCacheEntry;
+use lance_index::scalar::{FullTextSearchQuery, ScalarIndex};
+use lance_index::{FtsPrewarmOptions, PrewarmOptions};
+use lance_index::{IndexType, scalar::ScalarIndexParams, vector::DIST_COL};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
+use lance_linalg::distance::MetricType;
+use lance_select::IndexExprResult;
+
+use datafusion::common::{assert_contains, assert_not_contains};
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use futures::{StreamExt, TryStreamExt};
+use itertools::Itertools;
+use lance_arrow::json::ARROW_JSON_EXT_NAME;
+use lance_index::scalar::inverted::query::{CombinedFieldsQuery, FtsQuery, MultiMatchQuery};
+use lance_table::format::BasePath;
+use lance_testing::datagen::generate_random_array;
+use rand::Rng;
+use rstest::rstest;
+
+#[rstest]
+#[tokio::test]
+async fn test_create_index(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    let test_uri = TempStrDir::default();
+
+    let dimension = 16;
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "embeddings",
+        DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            dimension,
+        ),
+        false,
+    )]));
+
+    let float_arr = generate_random_array(2560 * dimension as usize);
+    let vectors = Arc::new(
+        <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+            float_arr, dimension,
+        )
+        .unwrap(),
+    );
+    let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
+
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset.validate().await.unwrap();
+
+    // Make sure valid arguments should create index successfully
+    let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
+    let index_meta = dataset
+        .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+    dataset.validate().await.unwrap();
+
+    // Verify the returned metadata
+    assert_eq!(index_meta.name, "embeddings_idx");
+    // The version should match the table version it was created from.
+    let expected = dataset.manifest.version - 1;
+    assert_eq!(index_meta.dataset_version, expected);
+    let fragment_bitmap = index_meta.fragment_bitmap.as_ref().unwrap();
+    assert_eq!(fragment_bitmap.len(), 1);
+    assert!(fragment_bitmap.contains(0));
+
+    // Append should inherit index
+    let write_params = WriteParams {
+        mode: WriteMode::Append,
+        data_storage_version: Some(data_storage_version),
+        ..Default::default()
+    };
+    let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let dataset = Dataset::write(reader, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    let actual = indices.first().unwrap().dataset_version;
+    let expected = dataset.manifest.version - 2;
+    assert_eq!(actual, expected);
+    dataset.validate().await.unwrap();
+    // Fragment bitmap should show the original fragments, and not include
+    // the newly appended fragment.
+    let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+    assert_eq!(fragment_bitmap.len(), 1);
+    assert!(fragment_bitmap.contains(0));
+
+    let actual_statistics: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics("embeddings_idx").await.unwrap()).unwrap();
+    let actual_statistics = actual_statistics.as_object().unwrap();
+    assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF_PQ");
+
+    let deltas = actual_statistics["indices"].as_array().unwrap();
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0]["metric_type"].as_str().unwrap(), "l2");
+    assert_eq!(deltas[0]["num_partitions"].as_i64().unwrap(), 10);
+
+    let segment_statistics = dataset
+        .index_segment_statistics("embeddings_idx", &[index_meta.uuid])
+        .await
+        .unwrap();
+    let assembled_statistics: serde_json::Value = serde_json::from_str(
+        &dataset
+            .index_statistics_from_segments("embeddings_idx", segment_statistics)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(assembled_statistics.as_object().unwrap(), actual_statistics);
+
+    assert!(dataset.index_statistics("non-existent_idx").await.is_err());
+    assert!(dataset.index_statistics("").await.is_err());
+
+    // Overwrite should invalidate index
+    let write_params = WriteParams {
+        mode: WriteMode::Overwrite,
+        data_storage_version: Some(data_storage_version),
+        ..Default::default()
+    };
+    let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()];
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let dataset = Dataset::write(reader, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+    assert!(dataset.manifest.index_section.is_none());
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+    dataset.validate().await.unwrap();
+
+    let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+    assert_eq!(fragment_bitmap.len(), 1);
+    assert!(fragment_bitmap.contains(0));
+}
+
+/// An index that merely *carries* a vector column must not be selected to
+/// answer an ANN query against that column.
+///
+/// Two traps this test is written to avoid:
+///   - `early_pruning` raises `minimum_nprobes`, which can mask selection
+///     differences behind a full scan of the partitions.
+///   - `num_partitions = 1` means the probe path is never reached at all (the
+///     fixture uses [`covering::NUM_PARTITIONS`]).
+/// Both make a broken selection rule look correct, so this asserts on the
+/// plan the scanner actually built, never on query results.
+#[tokio::test]
+async fn test_covered_vector_column_is_not_selected_for_ann() {
+    let test_uri = TempStrDir::default();
+    let mut dataset = covering::write_two_vector_column_dataset(&test_uri).await;
+    covering::create_ivf_pq_index(&mut dataset, "vec").await;
+    covering::declare_covering(&mut dataset, "vec", "payload_vec").await;
+
+    let query = generate_random_array(covering::DIMENSION as usize);
+
+    // An ANN query on the carried column must fall back to a flat scan.
+    let mut scan = dataset.scan();
+    // `use_index` stays on: the point is that selection declines this
+    // index, not that the caller disabled indexing.
+    scan.nearest("payload_vec", &query, 10).unwrap();
+    let plan = scan.explain_plan(true).await.unwrap();
+    assert!(
+        plan.contains("KNNVectorDistance"),
+        "expected a flat KNN plan for the covered column, got:\n{plan}"
+    );
+    assert!(
+        !plan.contains("ANNIvfPartition"),
+        "the covered column must not be served by the ANN index:\n{plan}"
+    );
+
+    // The keyed column still uses the index -- without this, the test would
+    // pass just as well against an index that was never selected at all.
+    let mut scan = dataset.scan();
+    scan.nearest("vec", &query, 10).unwrap();
+    let plan = scan.explain_plan(true).await.unwrap();
+    assert!(
+        plan.contains("ANNIvfPartition"),
+        "the keyed column must still use the index:\n{plan}"
+    );
+}
+
+/// A filtered `describe_indices` must still find a covered index by its keyed
+/// column. The matcher compares the caller's resolved field slice against the one
+/// column named by `for_column`, so a caller that passes all of `index.fields` --
+/// carried columns included -- pushes that slice past length one and gets a silent
+/// "no match" for every covered index.
+#[tokio::test]
+async fn test_describe_indices_filters_a_covered_index_by_its_keyed_field() {
+    use lance_index::IndexCriteria;
+
+    let test_uri = TempStrDir::default();
+    let mut dataset = covering::write_vector_payload_dataset(&test_uri).await;
+    covering::create_ivf_pq_index(&mut dataset, "vec").await;
+
+    // Baseline: the plain index is found, so a later miss is about covering.
+    let found = dataset
+        .describe_indices(Some(IndexCriteria::default().for_column("vec")))
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1, "precondition: the plain index is findable");
+
+    let (vec_id, _) = covering::declare_covering(&mut dataset, "vec", "payload").await;
+
+    let found = dataset
+        .describe_indices(Some(IndexCriteria::default().for_column("vec")))
+        .await
+        .unwrap();
+    assert_eq!(
+        found.len(),
+        1,
+        "a covered index must still be findable by its keyed column"
+    );
+    assert_eq!(
+        found[0].field_ids(),
+        &[vec_id as u32],
+        "and must advertise only the keyed column"
+    );
+
+    // The carried column is not searchable, so it must not match.
+    let carried = dataset
+        .describe_indices(Some(IndexCriteria::default().for_column("payload")))
+        .await
+        .unwrap();
+    assert!(
+        carried.is_empty(),
+        "a carried column must not advertise an index"
+    );
+}
+
+/// An unfiltered `optimize_indices()` is a table-wide request, so a covered index
+/// must not abort it -- that would block optimization of every other index on the
+/// table over one this build merely cannot rebuild. It is skipped with a warning.
+/// Only a caller that names the covered index gets an error (see
+/// `test_optimize_indices_rejects_a_covered_index`).
+///
+/// Both the current and the stale case are covered: erroring on the stale one
+/// aborts the loop before the replacements accumulated for the other groups are
+/// committed, leaving an unrelated index stale too.
+#[rstest]
+#[case::current(false)]
+#[case::stale(true)]
+#[tokio::test]
+async fn test_optimize_skips_a_covered_index_without_blocking_others(#[case] stale: bool) {
+    let test_uri = TempStrDir::default();
+    let mut dataset = covering::write_vector_payload_dataset(&test_uri).await;
+
+    // A covered vector index, and a plain scalar index that optimize may touch.
+    covering::create_ivf_pq_index(&mut dataset, "vec").await;
+    covering::create_btree_index(&mut dataset, "payload", Some("payload_idx")).await;
+
+    let (_, payload_id) = covering::declare_covering(&mut dataset, "vec", "payload").await;
+    let covered_uuid = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|idx| !idx.covering_fields.is_empty())
+        .expect("the covered index should exist")
+        .uuid;
+
+    if stale {
+        // Now *both* groups have an unindexed fragment, so the covered group
+        // would genuinely be rebuilt -- this is where the refusal used to fire.
+        covering::append_vector_payload_rows(&mut dataset, 256).await;
+    }
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .expect("a covered index must not abort an unfiltered optimize");
+
+    let after = dataset.load_indices().await.unwrap();
+    assert!(
+        after
+            .iter()
+            .any(|idx| idx.uuid == covered_uuid && idx.covering_fields == vec![payload_id]),
+        "the covered index must be left exactly as it was"
+    );
+
+    if stale {
+        let payload_idx = after
+            .iter()
+            .filter(|idx| idx.name == "payload_idx")
+            .filter_map(|idx| idx.fragment_bitmap.as_ref())
+            .fold(roaring::RoaringBitmap::new(), |mut acc, bitmap| {
+                acc |= bitmap;
+                acc
+            });
+        assert!(
+            payload_idx.contains(1),
+            "the unrelated index must still have been optimized onto the new fragment, got {payload_idx:?}"
+        );
+    } else {
+        assert_eq!(after.len(), 2, "both indices must survive");
+    }
+}
+
+/// The same skip, for a *scalar* covered index. The rule does not branch on index
+/// type, but scalar groups take their own no-work path a few lines below the
+/// covering gate, so a covered scalar index reaching that gate first is worth
+/// pinning separately from the vector case above.
+///
+/// The append is what gives this test teeth. Without it the covered group has no
+/// work either way, so the scalar no-work path below the gate produces the same
+/// observable outcome as the gate itself and the test passes with the gate
+/// removed entirely.
+#[tokio::test]
+async fn test_optimize_skips_a_stale_covered_scalar_index() {
+    let test_uri = TempStrDir::default();
+    let mut dataset = covering::write_three_int_column_dataset(&test_uri).await;
+    covering::create_btree_index(&mut dataset, "a", None).await;
+    covering::create_btree_index(&mut dataset, "b", None).await;
+
+    let (_, carried_id) = covering::declare_covering(&mut dataset, "a", "carried").await;
+    let covered_uuid = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|idx| !idx.covering_fields.is_empty())
+        .expect("the covered index should exist")
+        .uuid;
+
+    // Both scalar groups now have an unindexed fragment, so the covered one
+    // would genuinely be rebuilt if the gate did not skip it first.
+    covering::append_three_int_column_rows(&mut dataset, 64).await;
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .expect("a stale covered scalar index must not abort optimize");
+
+    let after = dataset.load_indices().await.unwrap();
+    assert!(
+        after
+            .iter()
+            .any(|idx| idx.uuid == covered_uuid && idx.covering_fields == vec![carried_id]),
+        "the covered scalar index must be left exactly as it was, not rebuilt"
+    );
+    // The unrelated scalar index was still maintained, so the skip is scoped to
+    // the covered group rather than aborting the loop.
+    let b_id = dataset.schema().field_id("b").unwrap();
+    let b_coverage = after
+        .iter()
+        .filter(|idx| idx.fields == vec![b_id])
+        .filter_map(|idx| idx.fragment_bitmap.as_ref())
+        .fold(roaring::RoaringBitmap::new(), |mut acc, bitmap| {
+            acc |= bitmap;
+            acc
+        });
+    assert!(
+        b_coverage.contains(1),
+        "the unrelated scalar index must still have been optimized onto the new fragment, got {b_coverage:?}"
+    );
+}
+
+/// A caller that names the covered index asked for it specifically, so the
+/// refusal is loud rather than a skip.
+#[tokio::test]
+async fn test_optimize_indices_rejects_a_covered_index() {
+    let test_uri = TempStrDir::default();
+    let mut dataset = covering::write_vector_payload_dataset(&test_uri).await;
+    covering::create_ivf_pq_index(&mut dataset, "vec").await;
+
+    // Nothing writes carried values, so the storage does not contain `payload`
+    // -- which is exactly why optimize must refuse: it rebuilds from a scan
+    // projecting the keyed field and `_rowid` only, and would republish the
+    // declaration on a segment that still has no payload.
+    let (vec_id, payload_id) = covering::declare_covering(&mut dataset, "vec", "payload").await;
+
+    // Append AFTER declaring covering, so the group really would be rebuilt.
+    // Without it this would assert the refusal against an index optimize had no
+    // work for, and would keep passing if the refusal moved behind a no-work
+    // check.
+    covering::append_vector_payload_rows(&mut dataset, 256).await;
+
+    let before = dataset.load_indices().await.unwrap();
+    let before_uuid = before[0].uuid;
+    let covered_name = before[0].name.clone();
+
+    // Name the covered index: the refusal is reserved for a caller that targeted
+    // it. An unfiltered call skips it instead, which
+    // `test_optimize_skips_a_covered_index_without_blocking_others` covers.
+    let err = dataset
+        .optimize_indices(&OptimizeOptions::default().index_names(vec![covered_name]))
+        .await
+        .expect_err("optimizing a targeted covered index must be refused");
+    assert!(
+        err.to_string().contains("declares covering fields"),
+        "unexpected message: {err}"
+    );
+
+    // Refused, not partially applied: the index is exactly as it was.
+    let after = dataset.load_indices().await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0].uuid, before_uuid,
+        "a refused optimize must not replace the index"
+    );
+    assert_eq!(after[0].covering_fields, vec![payload_id]);
+    assert_eq!(after[0].fields, vec![vec_id, payload_id]);
+
+    // The appended data above is unindexed, so this really is a case optimize
+    // would otherwise have merged -- the refusal is not the no-op path.
+    assert!(
+        after.iter().all(|idx| !idx.covering_fields.is_empty()),
+        "precondition: the only index is still the covered one"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_create_scalar_index(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+    #[values(false, true)] use_stable_row_id: bool,
+) {
+    let test_uri = TempStrDir::default();
+
+    let data = gen_batch().col("int", array::step::<Int32Type>());
+    // Write 64Ki rows.  We should get 16 4Ki pages
+    let mut dataset = Dataset::write(
+        data.into_reader_rows(RowCount::from(16 * 1024), BatchCount::from(4)),
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            enable_stable_row_ids: use_stable_row_id,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let index_name = "my_index".to_string();
+
+    dataset
+        .create_index(
+            &["int"],
+            IndexType::Scalar,
+            Some(index_name.clone()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let indices = dataset.load_indices_by_name(&index_name).await.unwrap();
+
+    assert_eq!(indices.len(), 1);
+    assert_eq!(indices[0].dataset_version, 1);
+    assert_eq!(indices[0].fields, vec![0]);
+    assert_eq!(indices[0].name, index_name);
+
+    dataset.index_statistics(&index_name).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_btree_nullable_filters_match_unindexed_scan() {
+    let test_uri = TempStrDir::default();
+    let num_rows = 10_000u64;
+    let values: Int32Array = (0..num_rows).map(|id| (id % 5 == 0).then_some(7)).collect();
+    let flags: BooleanArray = (0..num_rows)
+        .map(|id| (id % 3 != 0).then_some(id % 2 == 0))
+        .collect();
+    let ids = UInt64Array::from_iter_values(0..num_rows);
+    let batch = RecordBatch::try_from_iter(vec![
+        ("value", Arc::new(values) as ArrayRef),
+        ("flag", Arc::new(flags) as ArrayRef),
+        ("id", Arc::new(ids) as ArrayRef),
+    ])
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new([Ok(batch)], schema);
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 2_500,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(dataset.get_fragments().len() > 1);
+
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            Some("value_btree".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["flag"],
+            IndexType::BTree,
+            Some("flag_btree".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for predicate in [
+        "value = 7",
+        "value IN (7, 99)",
+        "NOT (value = 99)",
+        "NOT (value = 7)",
+        "NOT (value = 99 OR value = 7)",
+        "NOT (NOT (value = 7))",
+        // NULL rows are distinct from a value, and are neither TRUE nor FALSE.
+        "value IS NOT DISTINCT FROM 7",
+        "value IS DISTINCT FROM 7",
+        "value IS DISTINCT FROM 99",
+        "NOT (value IS DISTINCT FROM 7)",
+        "value IS NOT DISTINCT FROM NULL",
+        "(value IN (7, 99)) IS NOT TRUE",
+        "(value = 7) IS FALSE",
+        "(value != 7) IS NOT FALSE",
+        "flag IS TRUE",
+        "NOT (flag IS TRUE)",
+        "flag IS NOT FALSE",
+        // Predicates compared with each other are NULL where either one is.
+        "(value > 6) != (value < 7)",
+        "(value > 6) = (value < 7)",
+        "NOT ((value > 6) != (value < 8))",
+        "flag != (value = 7)",
+        "value = 99 OR value = 7",
+        // Float operands are rewritten exactly onto the integer column.
+        "value > 6.5",
+        "value = 6.5",
+        "value BETWEEN 6.5 AND 7.5",
+        "value IN (6.5, 7)",
+        // So are comparisons of the column cast to a float.
+        "CAST(value AS double) > 6.5",
+        "TRY_CAST(value AS double) = 7.0",
+        "NOT (CAST(value AS double) <= 7.0)",
+        "CAST(value AS double) BETWEEN 6.5 AND 7.5",
+        "CAST(value AS double) IN (6.5, 7.0)",
+    ] {
+        let mut indexed_scan = dataset.scan();
+        indexed_scan
+            .filter(predicate)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery") && plan.contains("BTree"),
+            "Expected BTree scalar index query for {predicate}:\n{plan}"
+        );
+        let indexed = indexed_scan.try_into_batch().await.unwrap();
+
+        let mut baseline_scan = dataset.scan();
+        baseline_scan.use_scalar_index(false);
+        baseline_scan
+            .filter(predicate)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let baseline = baseline_scan.try_into_batch().await.unwrap();
+
+        let sorted_ids = |batch: &RecordBatch| {
+            let mut ids = batch
+                .column(0)
+                .as_primitive::<UInt64Type>()
+                .values()
+                .to_vec();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(
+            sorted_ids(&indexed),
+            sorted_ids(&baseline),
+            "indexed result differs for {predicate}"
+        );
+    }
+}
+
+/// The FM index reports NULL text rows as FALSE rather than NULL, so a
+/// comparison between FM predicates must not be planned by negating them.
+#[tokio::test]
+async fn test_fm_predicate_equality_keeps_null_rows_null() {
+    let test_uri = TempStrDir::default();
+    let batch = arrow_array::record_batch!(
+        ("t", Utf8, [None, Some("needle"), Some("other")]),
+        ("u", Utf8, [Some("other"), Some("needle"), Some("needle")]),
+        ("id", UInt64, [0, 1, 2])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let write_params = WriteParams {
+        max_rows_per_file: 2,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+    let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm);
+    for column in ["t", "u"] {
+        dataset
+            .create_index(&[column], IndexType::Fm, None, &params, true)
+            .await
+            .unwrap();
+    }
+
+    // Row 0 is NULL in both comparisons, so neither keeps it.
+    for (predicate, expected) in [
+        ("contains(t, 'needle') = contains(u, 'needle')", vec![1]),
+        ("contains(t, 'needle') != contains(u, 'needle')", vec![2]),
+    ] {
+        for use_scalar_index in [true, false] {
+            let mut scan = dataset.scan();
+            scan.use_scalar_index(use_scalar_index)
+                .filter(predicate)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            let mut ids = batch["id"].as_primitive::<UInt64Type>().values().to_vec();
+            ids.sort_unstable();
+            assert_eq!(
+                ids, expected,
+                "{predicate}, use_scalar_index={use_scalar_index}"
+            );
+        }
+    }
+}
+
+async fn create_bad_file(data_storage_version: LanceFileVersion) -> Result<Dataset> {
+    let test_uri = TempStrDir::default();
+
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "a.b.c",
+        DataType::Int32,
+        false,
+    )]));
+
+    let batches: Vec<RecordBatch> = (0..20)
+        .map(|i| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
+            )
+            .unwrap()
+        })
+        .collect();
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn test_create_fts_index_with_empty_table() {
+    let test_uri = TempStrDir::default();
+
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "text",
+        DataType::Utf8,
+        false,
+    )]));
+
+    let batches: Vec<RecordBatch> = vec![];
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let mut dataset = Dataset::write(reader, &test_uri, None)
+        .await
+        .expect("write dataset");
+
+    let params = InvertedIndexParams::default();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let batch = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("lance".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_create_int8_index(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    use lance_testing::datagen::generate_random_int8_array;
+
+    let test_uri = TempStrDir::default();
+
+    let dimension = 16;
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "embeddings",
+        DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Int8, true)),
+            dimension,
+        ),
+        false,
+    )]));
+
+    let int8_arr = generate_random_int8_array(2560 * dimension as usize);
+    let vectors = Arc::new(
+        <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+            int8_arr, dimension,
+        )
+        .unwrap(),
+    );
+    let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
+
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset.validate().await.unwrap();
+
+    // Make sure valid arguments should create index successfully
+    let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
+    let index_meta = dataset
+        .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+    dataset.validate().await.unwrap();
+
+    // Verify the returned metadata
+    assert_eq!(index_meta.name, "embeddings_idx");
+    // The version should match the table version it was created from.
+    let expected = dataset.manifest.version - 1;
+    assert_eq!(index_meta.dataset_version, expected);
+    let fragment_bitmap = index_meta.fragment_bitmap.as_ref().unwrap();
+    assert_eq!(fragment_bitmap.len(), 1);
+    assert!(fragment_bitmap.contains(0));
+
+    // Append should inherit index
+    let write_params = WriteParams {
+        mode: WriteMode::Append,
+        data_storage_version: Some(data_storage_version),
+        ..Default::default()
+    };
+    let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let dataset = Dataset::write(reader, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    let actual = indices.first().unwrap().dataset_version;
+    let expected = dataset.manifest.version - 2;
+    assert_eq!(actual, expected);
+    dataset.validate().await.unwrap();
+    // Fragment bitmap should show the original fragments, and not include
+    // the newly appended fragment.
+    let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+    assert_eq!(fragment_bitmap.len(), 1);
+    assert!(fragment_bitmap.contains(0));
+
+    let actual_statistics: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics("embeddings_idx").await.unwrap()).unwrap();
+    let actual_statistics = actual_statistics.as_object().unwrap();
+    assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF_PQ");
+
+    let deltas = actual_statistics["indices"].as_array().unwrap();
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0]["metric_type"].as_str().unwrap(), "l2");
+    assert_eq!(deltas[0]["num_partitions"].as_i64().unwrap(), 10);
+
+    assert!(dataset.index_statistics("non-existent_idx").await.is_err());
+    assert!(dataset.index_statistics("").await.is_err());
+
+    // Overwrite should invalidate index
+    let write_params = WriteParams {
+        mode: WriteMode::Overwrite,
+        data_storage_version: Some(data_storage_version),
+        ..Default::default()
+    };
+    let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()];
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let dataset = Dataset::write(reader, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+    assert!(dataset.manifest.index_section.is_none());
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+    dataset.validate().await.unwrap();
+
+    let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+    assert_eq!(fragment_bitmap.len(), 1);
+    assert!(fragment_bitmap.contains(0));
+}
+
+#[tokio::test]
+async fn test_create_fts_index_with_empty_strings() {
+    let test_uri = TempStrDir::default();
+
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "text",
+        DataType::Utf8,
+        false,
+    )]));
+
+    let batches: Vec<RecordBatch> = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["", "", ""]))],
+        )
+        .unwrap(),
+    ];
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let mut dataset = Dataset::write(reader, &test_uri, None)
+        .await
+        .expect("write dataset");
+
+    let params = InvertedIndexParams::default();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let batch = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("lance".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_bad_field_name(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    // don't allow `.` in the field name
+    assert!(create_bad_file(data_storage_version).await.is_err());
+}
+
+#[tokio::test]
+async fn test_open_dataset_not_found() {
+    let result = Dataset::open(".").await;
+    assert!(matches!(result.unwrap_err(), Error::DatasetNotFound { .. }));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_search_empty(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    // Create a table
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "vec",
+        DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            128,
+        ),
+        false,
+    )]));
+
+    let test_uri = TempStrDir::default();
+
+    let vectors = Arc::new(
+        <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+            Float32Array::from_iter_values(vec![]),
+            128,
+        )
+        .unwrap(),
+    );
+
+    let data = RecordBatch::try_new(schema.clone(), vec![vectors]);
+    let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+    let dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut stream = dataset
+        .scan()
+        .nearest(
+            "vec",
+            &Float32Array::from_iter_values((0..128).map(|_| 0.1)),
+            1,
+        )
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+
+    while let Some(batch) = stream.next().await {
+        let schema = batch.unwrap().schema();
+        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(
+            schema.field_with_name("vec").unwrap(),
+            &ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    128
+                ),
+                false,
+            )
+        );
+        assert_eq!(
+            schema.field_with_name(DIST_COL).unwrap(),
+            &ArrowField::new(DIST_COL, DataType::Float32, true)
+        );
+    }
+}
+
+/// Rows deleted after the index was built must never come back from a vector
+/// search, also when deletions are the only prefilter and each segment's
+/// prefilter is its ownership mask alone. The compacted case retires fragment
+/// ids, so the masks have to restrict to the live fragments as well.
+#[rstest]
+#[tokio::test]
+async fn test_vector_search_excludes_rows_deleted_after_indexing(
+    #[values(false, true)] use_stable_row_id: bool,
+    #[values(false, true)] compact: bool,
+) {
+    let write_params = WriteParams {
+        max_rows_per_file: 300,
+        enable_stable_row_ids: use_stable_row_id,
+        ..Default::default()
+    };
+    let rows = |first_id: u64, num_rows: u64| {
+        gen_batch()
+            .col("id", array::step_custom::<UInt64Type>(first_id, 1))
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+            .into_reader_rows(RowCount::from(num_rows), BatchCount::from(1))
+    };
+    let mut dataset = Dataset::write(rows(0, 1200), "memory://", Some(write_params.clone()))
+        .await
+        .unwrap();
+    let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+    dataset
+        .create_index(&["vec"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+    dataset
+        .append(rows(1200, 600), Some(write_params))
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(dataset.load_indices().await.unwrap().len(), 2);
+
+    dataset.delete("id % 3 = 0").await.unwrap();
+    if compact {
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        dataset.delete("id % 3 = 1 AND id % 2 = 0").await.unwrap();
+    }
+
+    let live_ids = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap()["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let query = Float32Array::from_iter_values((0..16).map(|i| i as f32 / 16.0));
+    // Probing every partition with k above the row count returns every row the
+    // prefilter lets through, so the result must be exactly the live rows.
+    let results = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .nearest("vec", &query, 2000)
+        .unwrap()
+        .minimum_nprobes(2)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let found_ids = results["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    assert_eq!(found_ids.len(), results.num_rows());
+    assert_eq!(found_ids, live_ids);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_search_empty_after_delete(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+    #[values(false, true)] use_stable_row_id: bool,
+) {
+    // Create a table
+    let test_uri = TempStrDir::default();
+
+    let data = gen_batch().col("vec", array::rand_vec::<Float32Type>(Dimension::from(32)));
+    let reader = data.into_reader_rows(RowCount::from(500), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            enable_stable_row_ids: use_stable_row_id,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let params = VectorIndexParams::ivf_pq(1, 8, 1, MetricType::L2, 50);
+    dataset
+        .create_index(&["vec"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    dataset.delete("true").await.unwrap();
+
+    // This behavior will be re-introduced once we work on empty vector index handling.
+    // https://github.com/lance-format/lance/issues/4034
+    // let indices = dataset.load_indices().await.unwrap();
+    // // With the new retention behavior, indices are kept even when all fragments are deleted
+    // // This allows the index configuration to persist through data changes
+    // assert_eq!(indices.len(), 1);
+
+    // // Verify the index has an empty effective fragment bitmap
+    // let index = &indices[0];
+    // let effective_bitmap = index
+    //     .effective_fragment_bitmap(&dataset.fragment_bitmap)
+    //     .unwrap();
+    // assert!(effective_bitmap.is_empty());
+
+    let mut stream = dataset
+        .scan()
+        .nearest(
+            "vec",
+            &Float32Array::from_iter_values((0..32).map(|_| 0.1)),
+            1,
+        )
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+
+    while let Some(batch) = stream.next().await {
+        let schema = batch.unwrap().schema();
+        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(
+            schema.field_with_name("vec").unwrap(),
+            &ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    32
+                ),
+                false,
+            )
+        );
+        assert_eq!(
+            schema.field_with_name(DIST_COL).unwrap(),
+            &ArrowField::new(DIST_COL, DataType::Float32, true)
+        );
+    }
+
+    // predicate with redundant whitespace
+    dataset.delete(" True").await.unwrap();
+
+    let mut stream = dataset
+        .scan()
+        .nearest(
+            "vec",
+            &Float32Array::from_iter_values((0..32).map(|_| 0.1)),
+            1,
+        )
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+
+    while let Some(batch) = stream.next().await {
+        let batch = batch.unwrap();
+        let schema = batch.schema();
+        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(
+            schema.field_with_name("vec").unwrap(),
+            &ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    32
+                ),
+                false,
+            )
+        );
+        assert_eq!(
+            schema.field_with_name(DIST_COL).unwrap(),
+            &ArrowField::new(DIST_COL, DataType::Float32, true)
+        );
+        assert_eq!(batch.num_rows(), 0, "Expected no results after delete");
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_num_small_files(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    let test_uri = TempStrDir::default();
+    let dimensions = 16;
+    let column_name = "vec";
+    let field = ArrowField::new(
+        column_name,
+        DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            dimensions,
+        ),
+        false,
+    );
+
+    let schema = Arc::new(ArrowSchema::new(vec![field]));
+
+    let float_arr = generate_random_array(512 * dimensions as usize);
+    let vectors =
+        arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+
+    let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+
+    let reader = RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+
+    let dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset.validate().await.unwrap();
+
+    assert!(dataset.num_small_files(1024).await > 0);
+    assert!(dataset.num_small_files(512).await == 0);
+}
+
+#[tokio::test]
+async fn test_read_struct_of_dictionary_arrays() {
+    let test_uri = TempStrDir::default();
+
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+            "d",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )])),
+        true,
+    )]));
+
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    for _ in 1..2 {
+        let mut dict_builder = StringDictionaryBuilder::<Int32Type>::new();
+        dict_builder.append("a").unwrap();
+        dict_builder.append("b").unwrap();
+        dict_builder.append("c").unwrap();
+        dict_builder.append("d").unwrap();
+
+        let struct_array = Arc::new(StructArray::from(vec![(
+            Arc::new(ArrowField::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            )),
+            Arc::new(dict_builder.finish()) as ArrayRef,
+        )]));
+
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
+        batches.push(batch);
+    }
+
+    let batch_reader =
+        RecordBatchIterator::new(batches.clone().into_iter().map(Ok), arrow_schema.clone());
+    Dataset::write(batch_reader, &test_uri, Some(WriteParams::default()))
+        .await
+        .unwrap();
+
+    let result = scan_dataset(&test_uri).await.unwrap();
+
+    assert_eq!(batches, result);
+}
+
+#[tokio::test]
+async fn test_fts_fuzzy_query() {
+    let params = InvertedIndexParams::default();
+    let text_col = GenericStringArray::<i32>::from(vec![
+        "fa", "fo", "fob", "focus", "foo", "food", "foul", // # spellchecker:disable-line
+    ]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            text_col.data_type().to_owned(),
+            false,
+        )])
+        .into(),
+        vec![Arc::new(text_col) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(batches, &test_uri, None).await.unwrap();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new_fuzzy("foo".to_owned(), Some(1)))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 4);
+    let texts = results["text"]
+        .as_string::<i32>()
+        .iter()
+        .map(|s| s.unwrap().to_owned())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        texts,
+        vec![
+            "foo".to_owned(),  // 0 edits
+            "fo".to_owned(),   // 1 deletion        # spellchecker:disable-line
+            "fob".to_owned(),  // 1 substitution    # spellchecker:disable-line
+            "food".to_owned(), // 1 insertion       # spellchecker:disable-line
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>()
+    );
+}
+
+#[tokio::test]
+async fn test_fts_on_multiple_columns() {
+    let params = InvertedIndexParams::default();
+    let title_col =
+        GenericStringArray::<i32>::from(vec!["title common", "title hello", "title lance"]);
+    let content_col = GenericStringArray::<i32>::from(vec![
+        "content world",
+        "content database",
+        "content common",
+    ]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("title", title_col.data_type().to_owned(), false),
+            arrow_schema::Field::new("content", title_col.data_type().to_owned(), false),
+        ])
+        .into(),
+        vec![
+            Arc::new(title_col) as ArrayRef,
+            Arc::new(content_col) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(batches, &test_uri, None).await.unwrap();
+    dataset
+        .create_index(&["title"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+    dataset
+        .create_index(&["content"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("title".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 3);
+
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("content".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 3);
+
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("common".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 2);
+
+    let results = dataset
+        .scan()
+        .full_text_search(
+            FullTextSearchQuery::new("common".to_owned())
+                .with_column("title".to_owned())
+                .unwrap(),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+
+    let results = dataset
+        .scan()
+        .full_text_search(
+            FullTextSearchQuery::new("common".to_owned())
+                .with_column("content".to_owned())
+                .unwrap(),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+}
+
+async fn create_fragmented_fts_index(dataset: &mut Dataset, column: &str, with_position: bool) {
+    create_fragmented_fts_index_with_order(dataset, column, with_position, false).await;
+}
+
+async fn create_fragmented_fts_index_with_order(
+    dataset: &mut Dataset,
+    column: &str,
+    with_position: bool,
+    reverse_segments: bool,
+) {
+    let mut fragment_groups = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| vec![fragment.id() as u32])
+        .collect::<Vec<_>>();
+    if reverse_segments {
+        fragment_groups.reverse();
+    }
+    create_fragmented_fts_index_with_groups(dataset, column, with_position, fragment_groups).await;
+}
+
+async fn create_fragmented_fts_index_with_groups(
+    dataset: &mut Dataset,
+    column: &str,
+    with_position: bool,
+    fragment_groups: Vec<Vec<u32>>,
+) {
+    let index_name = format!("{column}_idx");
+    let columns = [column];
+    let params = InvertedIndexParams::default().with_position(with_position);
+    let expected_segments = fragment_groups.len();
+    let mut segments = Vec::with_capacity(expected_segments);
+    for fragment_ids in fragment_groups {
+        let mut builder = dataset
+            .create_index_builder(&columns, IndexType::Inverted, &params)
+            .name(index_name.clone())
+            .fragments(fragment_ids);
+        segments.push(builder.execute_uncommitted().await.unwrap());
+    }
+    dataset
+        .commit_existing_index_segments(&index_name, column, segments)
+        .await
+        .unwrap();
+
+    let segments =
+        crate::index::scalar::inverted::load_segments(dataset, column, DocumentGranularity::Row)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(segments.len(), expected_segments);
+}
+
+/// Three fragments over two indexed text columns, each column indexed as one
+/// segment per fragment.
+///
+/// Rows 3 and 4 carry the same text in both columns, so any query that scores
+/// them symmetrically produces an exact score tie and exposes tie ordering.
+async fn compound_fts_dataset() -> Dataset {
+    let batch = arrow_array::record_batch!(
+        (
+            "title",
+            Utf8,
+            [
+                "common",
+                "common filler filler filler filler filler filler filler",
+                "irrelevant",
+                "common tie",
+                "common tie",
+                "irrelevant"
+            ]
+        ),
+        (
+            "body",
+            Utf8,
+            [
+                "penalty",
+                "special",
+                "common",
+                "neutral",
+                "neutral",
+                "common filler filler filler penalty"
+            ]
+        )
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+    create_fragmented_fts_index(&mut dataset, "title", false).await;
+    create_fragmented_fts_index(&mut dataset, "body", false).await;
+    dataset
+}
+
+fn compound_multimatch_query() -> FtsQuery {
+    MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![10.0, 1.0])
+    .unwrap()
+    .into()
+}
+
+fn compound_combined_fields_query() -> FtsQuery {
+    CombinedFieldsQuery::try_new(
+        "common".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![10.0, 1.0])
+    .unwrap()
+    .into()
+}
+
+fn compound_match_query(term: &str, column: &str, boost: f32) -> FtsQuery {
+    MatchQuery::new(term.to_owned())
+        .with_column(Some(column.to_owned()))
+        .with_boost(boost)
+        .into()
+}
+
+async fn compound_fts_results(
+    dataset: &Dataset,
+    query: FtsQuery,
+    limit: Option<i64>,
+) -> Vec<(u64, f32)> {
+    let mut scan = dataset.scan();
+    scan.with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    if let Some(limit) = limit {
+        scan.limit(Some(limit), None).unwrap();
+    }
+    let batch = scan.try_into_batch().await.unwrap();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    row_ids
+        .iter()
+        .copied()
+        .zip(scores.iter().copied())
+        .collect()
+}
+
+fn scored_row_bits(rows: &[(u64, f32)]) -> Vec<(u64, u32)> {
+    rows.iter()
+        .map(|(row_id, score)| (*row_id, score.to_bits()))
+        .collect()
+}
+
+fn compound_fts_result_bits(batch: &RecordBatch) -> Vec<(u64, u32)> {
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    row_ids
+        .iter()
+        .copied()
+        .zip(scores.iter().map(|score| score.to_bits()))
+        .collect()
+}
+
+async fn assert_compound_fts_top_k(dataset: &Dataset, query: FtsQuery, limit: usize) {
+    let exhaustive = compound_fts_results(dataset, query.clone(), None).await;
+    assert!(
+        exhaustive.len() > limit,
+        "the exhaustive result must contain candidates beyond k"
+    );
+    let limited = compound_fts_results(dataset, query, Some(limit as i64)).await;
+    assert_eq!(limited, exhaustive[..limit]);
+}
+
+fn expected_must_score_sum(left: Vec<(u64, f32)>, right: Vec<(u64, f32)>) -> Vec<(u64, f32)> {
+    let right = right.into_iter().collect::<HashMap<_, _>>();
+    let mut expected = left
+        .into_iter()
+        .filter_map(|(row_id, left_score)| {
+            right
+                .get(&row_id)
+                .map(|right_score| (row_id, left_score + right_score))
+        })
+        .collect::<Vec<_>>();
+    expected.sort_unstable_by(|(left_row_id, left_score), (right_row_id, right_score)| {
+        right_score
+            .total_cmp(left_score)
+            .then_with(|| left_row_id.cmp(right_row_id))
+    });
+    expected
+}
+
+const CROSS_COLUMN_COMPOUND_FTS_SCORER: &str = "CrossColumnCompoundFtsScorer";
+
+fn independent_compound_fts_oracle<'a>(
+    dataset: &'a Dataset,
+    query: &'a FtsQuery,
+) -> Pin<Box<dyn Future<Output = HashMap<u64, f32>> + Send + 'a>> {
+    Box::pin(async move {
+        match query {
+            FtsQuery::Match(_) | FtsQuery::Phrase(_) => {
+                compound_fts_results(dataset, query.clone(), None)
+                    .await
+                    .into_iter()
+                    .collect()
+            }
+            FtsQuery::MultiMatch(query) => {
+                let mut result = HashMap::new();
+                for match_query in &query.match_queries {
+                    let leaf = FtsQuery::Match(match_query.clone());
+                    for (row_id, score) in independent_compound_fts_oracle(dataset, &leaf).await {
+                        result
+                            .entry(row_id)
+                            .and_modify(|current| {
+                                if score.total_cmp(current).is_gt() {
+                                    *current = score;
+                                }
+                            })
+                            .or_insert(score);
+                    }
+                }
+                result
+            }
+            FtsQuery::Boost(query) => {
+                let mut result =
+                    independent_compound_fts_oracle(dataset, query.positive.as_ref()).await;
+                let negative =
+                    independent_compound_fts_oracle(dataset, query.negative.as_ref()).await;
+                for (row_id, negative_score) in negative {
+                    if let Some(score) = result.get_mut(&row_id) {
+                        *score -= query.negative_boost * negative_score;
+                    }
+                }
+                result
+            }
+            FtsQuery::Boolean(query) => {
+                let mut required = None::<HashMap<u64, f32>>;
+                for clause in &query.must {
+                    let clause = independent_compound_fts_oracle(dataset, clause).await;
+                    if let Some(required) = required.as_mut() {
+                        required.retain(|row_id, score| {
+                            clause.get(row_id).is_some_and(|clause_score| {
+                                *score += *clause_score;
+                                true
+                            })
+                        });
+                    } else {
+                        required = Some(clause);
+                    }
+                }
+
+                let has_required = required.is_some();
+                let mut result = required.unwrap_or_default();
+                for clause in &query.should {
+                    let clause = independent_compound_fts_oracle(dataset, clause).await;
+                    for (row_id, clause_score) in clause {
+                        if has_required {
+                            if let Some(score) = result.get_mut(&row_id) {
+                                *score += clause_score;
+                            }
+                        } else {
+                            *result.entry(row_id).or_insert(0.0) += clause_score;
+                        }
+                    }
+                }
+
+                for clause in &query.must_not {
+                    for row_id in independent_compound_fts_oracle(dataset, clause)
+                        .await
+                        .keys()
+                    {
+                        result.remove(row_id);
+                    }
+                }
+                result
+            }
+            // This oracle scores each leaf against its own column's statistics,
+            // which is exactly what BM25F does not do. combined_fields never
+            // reaches the cross-column compound path.
+            FtsQuery::CombinedFields(_) => {
+                unreachable!("combined_fields is not a cross-column compound leaf")
+            }
+        }
+    })
+}
+
+fn sorted_compound_fts_oracle(result: HashMap<u64, f32>) -> Vec<(u64, f32)> {
+    result
+        .into_iter()
+        .sorted_unstable_by(|(left_row_id, left_score), (right_row_id, right_score)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| left_row_id.cmp(right_row_id))
+        })
+        .collect()
+}
+
+fn assert_scored_rows_close(case_name: &str, actual: &[(u64, f32)], expected: &[(u64, f32)]) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{case_name} returned a different number of rows"
+    );
+    for ((actual_row_id, actual_score), (expected_row_id, expected_score)) in
+        actual.iter().zip(expected)
+    {
+        assert_eq!(
+            actual_row_id, expected_row_id,
+            "{case_name} returned rows in the wrong order"
+        );
+        let tolerance = 1.0e-5 * expected_score.abs().max(1.0);
+        assert!(
+            (actual_score - expected_score).abs() <= tolerance,
+            "{case_name} returned score {actual_score} for row {actual_row_id}, expected {expected_score}"
+        );
+    }
+}
+
+async fn assert_compound_matches_independent_oracle(
+    dataset: &Dataset,
+    case_name: &str,
+    query: &FtsQuery,
+    limit: usize,
+) -> Vec<(u64, f32)> {
+    let mut expected =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(dataset, query).await);
+    assert!(
+        expected.len() > limit,
+        "{case_name} must have candidates beyond k"
+    );
+    expected.truncate(limit);
+    let actual = compound_fts_results(dataset, query.clone(), Some(limit as i64)).await;
+    assert_scored_rows_close(case_name, &actual, &expected);
+    actual
+}
+
+async fn compound_fts_plan(dataset: &Dataset, query: FtsQuery, limit: usize) -> String {
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    scanner.limit(Some(limit as i64), None).unwrap();
+    scanner.explain_plan(false).await.unwrap()
+}
+
+async fn write_cross_column_compound_dataset() -> Dataset {
+    let batch = arrow_array::record_batch!(
+        (
+            "title",
+            Utf8,
+            [
+                "alpha quick brown fox",
+                "alpha quick fox brown",
+                "quick brown fox",
+                "tie",
+                "alpha blocked",
+                "noise",
+                "alpha quick brown",
+                "tie",
+                "alpha",
+                "noise"
+            ]
+        ),
+        (
+            "body",
+            Utf8,
+            [
+                "gamma",
+                "gamma gamma optional",
+                "gamma",
+                "tiebody",
+                "gamma blocked",
+                "gamma optional",
+                "noise",
+                "tiebody",
+                "optional",
+                "blocked"
+            ]
+        ),
+        ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 5,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset
+}
+
+#[tokio::test]
+async fn test_cross_column_compound_scorer_matches_independent_leaf_oracle() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let phrase = || {
+        PhraseQuery::new("quick brown".to_owned())
+            .with_column(Some("title".to_owned()))
+            .into()
+    };
+    let phrase_approximation: FtsQuery = MatchQuery::new("quick brown".to_owned())
+        .with_column(Some("title".to_owned()))
+        .with_operator(Operator::And)
+        .into();
+    let phrase_query = phrase();
+    let phrase_matches = independent_compound_fts_oracle(&dataset, &phrase_query).await;
+    let approximation_matches =
+        independent_compound_fts_oracle(&dataset, &phrase_approximation).await;
+    assert!(
+        approximation_matches.len() > phrase_matches.len(),
+        "the fixture must include an approximation hit rejected by phrase confirmation"
+    );
+
+    let nested_required: FtsQuery = BooleanQuery::new([
+        (Occur::Should, compound_match_query("alpha", "title", 2.0)),
+        (Occur::Should, compound_match_query("gamma", "body", 3.0)),
+    ])
+    .into();
+    let staged_required_optional: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("alpha", "title", 1.0)),
+        (Occur::Should, compound_match_query("optional", "body", 4.0)),
+    ])
+    .into();
+    let cases: Vec<(&str, FtsQuery, usize)> = vec![
+        (
+            "must_sum",
+            BooleanQuery::new([
+                (Occur::Must, compound_match_query("alpha", "title", 2.0)),
+                (Occur::Must, compound_match_query("gamma", "body", 3.0)),
+            ])
+            .into(),
+            2,
+        ),
+        (
+            "should_sum",
+            BooleanQuery::new([
+                (Occur::Should, compound_match_query("alpha", "title", 2.0)),
+                (Occur::Should, compound_match_query("gamma", "body", 3.0)),
+            ])
+            .into(),
+            3,
+        ),
+        ("required_optional", staged_required_optional.clone(), 3),
+        (
+            "must_not",
+            BooleanQuery::new([
+                (Occur::Must, compound_match_query("gamma", "body", 3.0)),
+                (
+                    Occur::MustNot,
+                    compound_match_query("blocked", "title", 1_000_000.0),
+                ),
+            ])
+            .into(),
+            3,
+        ),
+        (
+            "phrase_two_phase",
+            BooleanQuery::new([
+                (Occur::Must, phrase()),
+                (Occur::Must, compound_match_query("gamma", "body", 1.0)),
+            ])
+            .into(),
+            1,
+        ),
+        (
+            "boost",
+            BoostQuery::new(
+                compound_match_query("gamma", "body", 3.0),
+                compound_match_query("alpha", "title", 2.0),
+                Some(0.5),
+            )
+            .into(),
+            3,
+        ),
+        (
+            "nested",
+            BooleanQuery::new([
+                (Occur::Must, nested_required),
+                (Occur::Should, phrase()),
+                (Occur::MustNot, compound_match_query("blocked", "body", 1.0)),
+            ])
+            .into(),
+            3,
+        ),
+    ];
+
+    let mut plans = Vec::with_capacity(cases.len());
+    for (case_name, query, limit) in cases {
+        assert_compound_matches_independent_oracle(&dataset, case_name, &query, limit).await;
+        plans.push((case_name, compound_fts_plan(&dataset, query, limit).await));
+    }
+
+    for (case_name, plan) in plans {
+        assert!(
+            plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+            "{case_name} should use the cross-column scorer:\n{plan}"
+        );
+        assert!(
+            !plan.contains("HashJoinExec"),
+            "{case_name} should not materialize an intermediate hash join:\n{plan}"
+        );
+    }
+
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(
+            staged_required_optional.clone(),
+        ))
+        .unwrap();
+    scanner.limit(Some(3), None).unwrap();
+    let staged_results = compound_fts_result_bits(&scanner.try_into_batch().await.unwrap());
+
+    dataset
+        .prewarm_index_with_options(
+            "title_idx",
+            &PrewarmOptions::Fts(FtsPrewarmOptions::default()),
+        )
+        .await
+        .unwrap();
+    dataset
+        .prewarm_index_with_options(
+            "body_idx",
+            &PrewarmOptions::Fts(FtsPrewarmOptions::default()),
+        )
+        .await
+        .unwrap();
+
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(staged_required_optional))
+        .unwrap();
+    scanner.limit(Some(3), None).unwrap();
+    let resident_results = compound_fts_result_bits(&scanner.try_into_batch().await.unwrap());
+    assert_eq!(
+        resident_results, staged_results,
+        "resident and staged cross-column scans must return identical ordered row ids and score bits"
+    );
+}
+
+#[tokio::test]
+async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorers() {
+    const LIMIT: usize = 2;
+
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let explicit_query: FtsQuery = MultiMatchQuery::try_new(
+        "noise".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let explicit_oracle = sorted_compound_fts_oracle(
+        independent_compound_fts_oracle(&dataset, &explicit_query).await,
+    );
+    assert_eq!(
+        explicit_oracle[1].1, explicit_oracle[2].1,
+        "the fixture should exercise an equal-score tie at the top-k boundary"
+    );
+    assert!(explicit_oracle[1].0 < explicit_oracle[2].0);
+    let explicit_results = assert_compound_matches_independent_oracle(
+        &dataset,
+        "top_level_cross_column_multimatch",
+        &explicit_query,
+        LIMIT,
+    )
+    .await;
+    let explicit_plan = compound_fts_plan(&dataset, explicit_query.clone(), LIMIT).await;
+    assert!(
+        !explicit_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "top-level MultiMatch should keep field scoring independent:\n{explicit_plan}"
+    );
+    assert!(
+        explicit_plan.matches("CompoundFtsScorer").count() >= 2,
+        "each indexed field should use its own bounded compound scorer:\n{explicit_plan}"
+    );
+    let inferred_query = FtsQuery::Match(MatchQuery::new("noise".to_owned()));
+    let inferred_results =
+        compound_fts_results(&dataset, inferred_query.clone(), Some(LIMIT as i64)).await;
+    assert_eq!(
+        inferred_results, explicit_results,
+        "a fieldless Match expanded across all FTS columns should match an explicit MultiMatch"
+    );
+    let inferred_plan = compound_fts_plan(&dataset, inferred_query, LIMIT).await;
+    assert!(
+        !inferred_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "a fieldless Match expanded to MultiMatch should keep field scoring independent:\n{inferred_plan}"
+    );
+    assert!(
+        inferred_plan.matches("CompoundFtsScorer").count() >= 2,
+        "each inferred field should use its own bounded compound scorer:\n{inferred_plan}"
+    );
+
+    let blocked_query = |boosts: Vec<f32>| -> FtsQuery {
+        MultiMatchQuery::try_new(
+            "blocked".to_owned(),
+            vec!["title".to_owned(), "body".to_owned()],
+        )
+        .unwrap()
+        .try_with_boosts(boosts)
+        .unwrap()
+        .into()
+    };
+    let signed_zero = compound_fts_results(&dataset, blocked_query(vec![-0.0, 0.0]), Some(1)).await;
+    let normalized = compound_fts_results(&dataset, blocked_query(vec![0.0, 0.0]), None).await;
+    assert_eq!(signed_zero, normalized[..1]);
+    assert_eq!(signed_zero[0].0, 4);
+    assert_eq!(signed_zero[0].1.to_bits(), 0.0_f32.to_bits());
+
+    let unbounded_results = compound_fts_results(&dataset, explicit_query.clone(), None).await;
+    assert_scored_rows_close(
+        "unbounded_top_level_cross_column_multimatch",
+        &unbounded_results,
+        &explicit_oracle,
+    );
+    let mut unbounded_scanner = dataset.scan();
+    unbounded_scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(explicit_query.clone()))
+        .unwrap();
+    let unbounded_plan = unbounded_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        !unbounded_plan.contains("CompoundFtsScorer"),
+        "an unbounded MultiMatch should retain exhaustive leaf planning:\n{unbounded_plan}"
+    );
+
+    let mut partial_dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut partial_dataset, "body", true).await;
+    let appended = arrow_array::record_batch!(
+        ("title", Utf8, ["noise"]),
+        ("body", Utf8, ["noise"]),
+        ("id", Int32, [10])
+    )
+    .unwrap();
+    let schema = appended.schema();
+    partial_dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+    // Index only the title after the append so it can retain a bounded plan
+    // while the partially covered body uses a query-local hybrid scorer.
+    create_fragmented_fts_index(&mut partial_dataset, "title", true).await;
+    partial_dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let partial_results =
+        compound_fts_results(&partial_dataset, explicit_query.clone(), Some(LIMIT as i64)).await;
+    let partial_plan = compound_fts_plan(&partial_dataset, explicit_query.clone(), LIMIT).await;
+    assert!(
+        !partial_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "top-level MultiMatch should keep field scoring independent:\n{partial_plan}"
+    );
+    assert_eq!(
+        partial_plan.matches("CompoundFtsScorer").count(),
+        2,
+        "both fields should retain field-local bounded compound scorers:\n{partial_plan}"
+    );
+    assert_eq!(
+        partial_plan.matches("HybridCompoundFtsScorer").count(),
+        1,
+        "only the partially covered body should use a query-local hybrid scorer:\n{partial_plan}"
+    );
+    assert!(
+        !partial_plan.contains("FlatMatchQuery"),
+        "the hybrid body scorer should replace the indexed-plus-flat fallback:\n{partial_plan}"
+    );
+
+    let mut fast_scanner = partial_dataset.scan();
+    fast_scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(explicit_query.clone()))
+        .unwrap()
+        .fast_search();
+    fast_scanner.limit(Some(LIMIT as i64), None).unwrap();
+    let fast_plan = fast_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        !fast_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "top-level MultiMatch should keep field scoring independent:\n{fast_plan}"
+    );
+    assert_eq!(
+        fast_plan.matches("CompoundFtsScorer").count(),
+        2,
+        "fast search should use a field-local compound scorer for both fields:\n{fast_plan}"
+    );
+    assert!(
+        !fast_plan.contains("FlatMatchQuery"),
+        "fast search must skip the partially covered body's flat path:\n{fast_plan}"
+    );
+
+    assert_eq!(
+        partial_results.len(),
+        LIMIT,
+        "the approximate residual path must still return a bounded top-k"
+    );
+    assert!(
+        partial_results.iter().all(|(_, score)| score.is_finite()),
+        "committed-index statistics must produce finite residual scores"
+    );
+}
+
+#[rstest]
+#[case::full(false)]
+#[case::hybrid(true)]
+#[tokio::test]
+async fn test_multimatch_shared_prefilter(
+    #[values(false, true)] use_scalar_index: bool,
+    #[case] partial_scalar_coverage: bool,
+) {
+    const FILTER: &str = "id IN (0, 2, 5, 6, 8)";
+    const LIMIT: usize = 3;
+
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+    let covered = if partial_scalar_coverage {
+        1
+    } else {
+        dataset.fragments().len()
+    };
+    let fragments = dataset.fragments()[..covered]
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let segment = dataset
+        .create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .name("id_idx".to_owned())
+        .fragments(fragments)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments("id_idx", "id", vec![segment])
+        .await
+        .unwrap();
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "noise".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .into();
+
+    let mut allowed_scan = dataset.scan();
+    allowed_scan.use_scalar_index(false);
+    allowed_scan.with_row_id().filter(FILTER).unwrap();
+    let allowed = allowed_scan.try_into_batch().await.unwrap();
+    let allowed_row_ids = allowed[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut expected = independent_compound_fts_oracle(&dataset, &query).await;
+    expected.retain(|row_id, _| allowed_row_ids.contains(row_id));
+    let mut expected = sorted_compound_fts_oracle(expected);
+    expected.truncate(LIMIT);
+
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .use_scalar_index(use_scalar_index)
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter(FILTER)
+        .unwrap()
+        .limit(Some(LIMIT as i64), None)
+        .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert_eq!(
+        plan.matches("CompoundFtsScorer").count(),
+        2,
+        "both fields should keep their bounded scorer:\n{plan}"
+    );
+    assert_eq!(
+        plan.matches("ScalarIndexQuery").count(),
+        usize::from(use_scalar_index) * 2,
+        "each field should declare the shared prefilter dependency:\n{plan}"
+    );
+    if use_scalar_index && partial_scalar_coverage {
+        assert_eq!(plan.matches("PrefilterUnion:").count(), 2, "{plan}");
+        let analyzed = scanner.analyze_plan().await.unwrap();
+        let unions = analyzed
+            .lines()
+            .filter(|line| line.trim_start().starts_with("PrefilterUnion:"))
+            .collect::<Vec<_>>();
+        assert_eq!(unions.len(), 2, "{analyzed}");
+        assert_eq!(
+            unions
+                .iter()
+                .filter(|line| line.contains("prefilter_loads=1,"))
+                .count(),
+            1,
+            "the shared source must load missing-fragment row IDs once: {analyzed}"
+        );
+    }
+
+    let batch = scanner.try_into_batch().await.unwrap();
+    let actual = batch[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            batch[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .copied(),
+        )
+        .collect::<Vec<_>>();
+    assert_scored_rows_close("shared_multimatch_prefilter", &actual, &expected);
+}
+
+#[tokio::test]
+async fn test_multimatch_shared_prefilter_preserves_deletes() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+    dataset.delete("id = 1").await.unwrap();
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "noise".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let mut expected =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &query).await);
+    expected.truncate(3);
+
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .use_scalar_index(false)
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter("id >= 0")
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap();
+    let actual = scanner.try_into_batch().await.unwrap();
+    let actual = actual[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            actual[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .copied(),
+        )
+        .collect::<Vec<_>>();
+    assert_scored_rows_close("shared_prefilter_deletes", &actual, &expected);
+}
+
+#[tokio::test]
+async fn test_multimatch_shared_prefilter_when_first_field_is_flat_only() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "noise".to_owned(),
+        vec!["body".to_owned(), "title".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter("id >= 0")
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("FlatMatchQuery") && plan.contains("SharedMultiMatchPrefilter"),
+        "the later indexed field must retain the declared shared source:\n{plan}"
+    );
+    scanner.try_into_batch().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_multimatch_fields_have_independent_fuzzy_expansion_budgets() {
+    let batch = arrow_array::record_batch!(
+        ("title", Utf8, ["alpha", "nothing"]),
+        ("body", Utf8, ["nothing", "alphi"]),
+        ("id", Int32, [0, 1])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let fuzzy_multimatch = || {
+        let mut query = MultiMatchQuery::try_new(
+            "alphx".to_owned(),
+            vec!["title".to_owned(), "body".to_owned()],
+        )
+        .unwrap();
+        for field in &mut query.match_queries {
+            field.fuzziness = Some(1);
+            field.max_expansions = 1;
+        }
+        query
+    };
+
+    let top_level: FtsQuery = fuzzy_multimatch().into();
+    let top_level_plan = compound_fts_plan(&dataset, top_level.clone(), 10).await;
+    assert!(top_level_plan.matches("CompoundFtsScorer").count() >= 2);
+    assert!(!top_level_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER));
+    let top_level_results = compound_fts_results(&dataset, top_level, Some(10)).await;
+    assert_eq!(top_level_results.len(), 2);
+
+    let nested: FtsQuery =
+        BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(fuzzy_multimatch()))]).into();
+    let nested_plan = compound_fts_plan(&dataset, nested.clone(), 10).await;
+    assert!(nested_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER));
+    let nested_results = compound_fts_results(&dataset, nested, Some(10)).await;
+    assert_scored_rows_close(
+        "multimatch_independent_fuzzy_budgets",
+        &nested_results,
+        &top_level_results,
+    );
+}
+
+#[tokio::test]
+async fn test_dataset_planner_defers_auto_fuzziness_for_partial_indices() {
+    let indexed = arrow_array::record_batch!(
+        ("title", Utf8, ["alpha"]),
+        ("body", Utf8, ["alpha"]),
+        ("id", Int32, [0])
+    )
+    .unwrap();
+    let schema = indexed.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![indexed].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let unindexed = arrow_array::record_batch!(
+        ("title", Utf8, ["alpha"]),
+        ("body", Utf8, ["alpha"]),
+        ("id", Int32, [1])
+    )
+    .unwrap();
+    let schema = unindexed.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![unindexed].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let auto_match = |terms: &str| -> FtsQuery {
+        MatchQuery::new(terms.to_owned())
+            .with_column(Some("title".to_owned()))
+            .with_fuzziness(None)
+            .into()
+    };
+    let auto_multimatch = |terms: &str| {
+        let mut query = MultiMatchQuery::try_new(
+            terms.to_owned(),
+            vec!["title".to_owned(), "body".to_owned()],
+        )
+        .unwrap();
+        for match_query in &mut query.match_queries {
+            match_query.fuzziness = None;
+        }
+        query
+    };
+
+    for (case_name, query, expected_ids) in [
+        ("match_exact", auto_match("ALPHA"), &[0, 1][..]),
+        ("match_typo", auto_match("alphx"), &[][..]),
+        (
+            "multimatch_exact",
+            FtsQuery::MultiMatch(auto_multimatch("ALPHA")),
+            &[0, 1][..],
+        ),
+        (
+            "multimatch_typo",
+            FtsQuery::MultiMatch(auto_multimatch("alphx")),
+            &[][..],
+        ),
+        (
+            "nested_multimatch_exact",
+            BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(auto_multimatch("ALPHA")))])
+                .into(),
+            &[0, 1][..],
+        ),
+        (
+            "nested_multimatch_typo",
+            BooleanQuery::new([(Occur::Must, FtsQuery::MultiMatch(auto_multimatch("alphx")))])
+                .into(),
+            &[][..],
+        ),
+    ] {
+        let batch = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(query).limit(Some(10)))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values(),
+            expected_ids,
+            "indexed and unindexed rows diverged for {case_name}"
+        );
+    }
+}
+
+#[rstest]
+#[case::empty(0)]
+#[case::underfilled(5)]
+#[case::high_hits(544)]
+#[tokio::test]
+async fn test_root_match_and_modern_bulk(
+    #[values(4, 16)] num_terms: usize,
+    #[case] expected_matches: usize,
+) {
+    const NUM_DOCS: usize = 544;
+    const ROWS_PER_FRAGMENT: usize = NUM_DOCS / 2;
+    const DOC_LENGTH: usize = 64;
+    const LIMIT: usize = 10;
+    const TERMS: [&str; 16] = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+        "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
+    ];
+    let terms = &TERMS[..num_terms];
+    let is_high_hits = expected_matches == NUM_DOCS;
+    let matching_rows = [
+        0,
+        ROWS_PER_FRAGMENT - 1,
+        ROWS_PER_FRAGMENT,
+        NUM_DOCS - 2,
+        NUM_DOCS - 1,
+    ];
+    let frequencies = (0..NUM_DOCS)
+        .map(|row| {
+            let is_match = is_high_hits || (expected_matches == 5 && matching_rows.contains(&row));
+            (0..num_terms)
+                .map(|term| {
+                    if !is_match && row % num_terms == term {
+                        0_usize
+                    } else if is_high_hits && row >= NUM_DOCS - LIMIT {
+                        2
+                    } else {
+                        1
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let documents = frequencies
+        .iter()
+        .map(|frequencies| {
+            let mut tokens = terms
+                .iter()
+                .zip(frequencies)
+                .flat_map(|(&term, &frequency)| std::iter::repeat_n(term, frequency))
+                .collect::<Vec<_>>();
+            assert!(tokens.len() <= DOC_LENGTH);
+            tokens.resize(DOC_LENGTH, "padding");
+            tokens.join(" ")
+        })
+        .collect::<Vec<_>>();
+    let batch = arrow_array::record_batch!(
+        ("text", Utf8, documents),
+        ("id", UInt64, (0..NUM_DOCS as u64).collect::<Vec<_>>())
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: ROWS_PER_FRAGMENT,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let params = InvertedIndexParams::default()
+        .with_position(false)
+        .stem(false)
+        .remove_stop_words(false)
+        .block_size(256)
+        .unwrap()
+        .format_version(InvertedListFormatVersion::V3);
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+    let row_mapping = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .with_row_id()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = row_mapping["id"].as_primitive::<UInt64Type>();
+    let row_ids = row_mapping[ROW_ID].as_primitive::<UInt64Type>();
+
+    // Every document has the same exactly representable byte-norm length.
+    // Compute BM25 independently from the fixture's corpus-wide term counts.
+    let weights = (0..num_terms)
+        .map(|term| {
+            let document_frequency = frequencies.iter().filter(|row| row[term] > 0).count() as f32;
+            ((NUM_DOCS as f32 - document_frequency + 0.5) / (document_frequency + 0.5) + 1.0).ln()
+        })
+        .collect::<Vec<_>>();
+    let mut expected = ids
+        .values()
+        .iter()
+        .zip(row_ids.values())
+        .filter_map(|(&id, &row_id)| {
+            let frequencies = &frequencies[id as usize];
+            if frequencies.contains(&0) {
+                return None;
+            }
+            let score = weights
+                .iter()
+                .zip(frequencies)
+                .fold(0.0_f32, |sum, (&weight, &freq)| {
+                    let freq = freq as f32;
+                    sum + weight * ((1.2_f32 + 1.0) * freq / (freq + 1.2))
+                });
+            Some((row_id, score))
+        })
+        .collect::<Vec<_>>();
+    let rank = |left: &(u64, f32), right: &(u64, f32)| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    };
+    expected.sort_unstable_by(rank);
+    assert_eq!(expected.len(), expected_matches);
+    if is_high_hits {
+        assert!(expected[LIMIT - 1].1 > expected[LIMIT].1);
+    }
+    expected.truncate(LIMIT);
+
+    let query: FtsQuery = MatchQuery::new(terms.join(" "))
+        .with_column(Some("text".to_owned()))
+        .with_operator(Operator::And)
+        .with_fuzziness(Some(0))
+        .into();
+    let plan = compound_fts_plan(&dataset, query.clone(), LIMIT).await;
+    assert!(plan.contains("MatchQuery: column=text"), "{plan}");
+    assert!(
+        !plan.contains("FlatMatchQuery") && !plan.contains("CompoundFtsScorer"),
+        "{plan}"
+    );
+    let mut actual = compound_fts_results(&dataset, query, Some(LIMIT as i64)).await;
+    actual.sort_unstable_by(rank);
+    assert_eq!(scored_row_bits(&actual), scored_row_bits(&expected));
+}
+
+#[tokio::test]
+async fn test_field_local_match_wand_exactness_certificates() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index_with_order(&mut dataset, "title", true, true).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "body", true, true).await;
+
+    let field_local_query = |term: &str| -> FtsQuery {
+        MultiMatchQuery::try_new(term.to_owned(), vec!["title".to_owned(), "body".to_owned()])
+            .unwrap()
+            .into()
+    };
+
+    let strict_query = field_local_query("alpha");
+    let strict_plan = compound_fts_plan(&dataset, strict_query.clone(), 1).await;
+    assert!(
+        strict_plan.matches("CompoundFtsScorer").count() >= 2
+            && !strict_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "certificate coverage must execute through field-local compound children:\n{strict_plan}"
+    );
+    let strict_oracle =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &strict_query).await);
+    assert!(strict_oracle[0].1.total_cmp(&strict_oracle[1].1).is_gt());
+    let strict = compound_fts_results(&dataset, strict_query, Some(1)).await;
+    assert_scored_rows_close("wand_certificate_strict", &strict, &strict_oracle[..1]);
+
+    let exhaustive_query = field_local_query("tiebody");
+    let exhaustive_oracle = sorted_compound_fts_oracle(
+        independent_compound_fts_oracle(&dataset, &exhaustive_query).await,
+    );
+    let exhaustive = compound_fts_results(&dataset, exhaustive_query, Some(3)).await;
+    assert_scored_rows_close(
+        "wand_certificate_exhaustive",
+        &exhaustive,
+        &exhaustive_oracle,
+    );
+
+    let tied_query = field_local_query("tie");
+    let tied_oracle =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &tied_query).await);
+    assert_eq!(tied_oracle.len(), 2);
+    assert_eq!(tied_oracle[0].1, tied_oracle[1].1);
+    assert!(tied_oracle[0].0 < tied_oracle[1].0);
+    let tied = compound_fts_results(&dataset, tied_query, Some(1)).await;
+    assert_scored_rows_close("wand_certificate_tie_completion", &tied, &tied_oracle[..1]);
+
+    let mixed_query = field_local_query("noise");
+    let mixed_oracle =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &mixed_query).await);
+    let mixed = compound_fts_results(&dataset, mixed_query, Some(1)).await;
+    assert_scored_rows_close("wand_certificate_mixed_fields", &mixed, &mixed_oracle[..1]);
+
+    for (case_name, exact_term, fuzzy_term, limit) in [
+        ("strict", "alpha", "alphx", 1),
+        ("exhaustive", "tiebody", "tiebodx", 3),
+        ("ambiguous", "tie", "tix", 1),
+    ] {
+        let exact =
+            compound_fts_results(&dataset, field_local_query(exact_term), Some(limit)).await;
+        let mut fuzzy = MultiMatchQuery::try_new(
+            fuzzy_term.to_owned(),
+            vec!["title".to_owned(), "body".to_owned()],
+        )
+        .unwrap();
+        for query in &mut fuzzy.match_queries {
+            query.fuzziness = Some(1);
+        }
+        let actual = compound_fts_results(&dataset, fuzzy.into(), Some(limit)).await;
+        assert_scored_rows_close(
+            &format!("fuzzy_wand_certificate_{case_name}"),
+            &actual,
+            &exact,
+        );
+    }
+}
+
+async fn write_wand_tie_dataset(num_ties: usize) -> Dataset {
+    let reader = gen_batch()
+        .col("title", array::fill_utf8("token".to_owned()))
+        .col("body", array::fill_utf8("unrelated".to_owned()))
+        .into_reader_rows(
+            RowCount::from(u64::try_from(num_ties).unwrap()),
+            BatchCount::from(1),
+        );
+    let dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: num_ties.div_ceil(2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset
+}
+
+fn wand_tie_multimatch(terms: &str, boost: f32, fuzziness: Option<u32>) -> FtsQuery {
+    let mut query = MultiMatchQuery::try_new(
+        terms.to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![boost, 1.0])
+    .unwrap();
+    for match_query in &mut query.match_queries {
+        match_query.fuzziness = fuzziness;
+    }
+    query.into()
+}
+
+#[tokio::test]
+async fn test_wand_tie_completion_recovers_reversed_segment_row_id() {
+    let mut dataset = write_wand_tie_dataset(6).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "title", true, true).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "body", true, true).await;
+    let query = wand_tie_multimatch("token", 1.0, Some(0));
+    let oracle = compound_fts_results(&dataset, query.clone(), None).await;
+    assert_eq!(oracle.len(), 6);
+    assert_eq!(oracle[0].0, 0);
+
+    let actual = compound_fts_results(&dataset, query, Some(1)).await;
+
+    assert_scored_rows_close(
+        "wand_tie_completion_reversed_segments",
+        &actual,
+        &oracle[..1],
+    );
+}
+
+#[tokio::test]
+async fn test_wand_tie_overflow_uses_seeded_fuzzy_boosted_fallback() {
+    const NUM_TIES: usize = 131;
+    let mut dataset = write_wand_tie_dataset(NUM_TIES).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "title", true, true).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "body", true, true).await;
+    let query = wand_tie_multimatch("tiken", 2.5, Some(1));
+    let oracle = compound_fts_results(&dataset, query.clone(), None).await;
+    assert_eq!(oracle.len(), NUM_TIES);
+    assert_eq!(oracle[0].0, 0);
+
+    let actual = compound_fts_results(&dataset, query, Some(1)).await;
+
+    assert_scored_rows_close("wand_tie_seeded_fuzzy_boost", &actual, &oracle[..1]);
+}
+
+#[tokio::test]
+async fn test_cross_column_compound_uses_one_scalar_prefilter_mask() {
+    const FILTER: &str = "id IN (0, 2, 5, 6, 8)";
+    const LIMIT: usize = 3;
+
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, compound_match_query("alpha", "title", 2.0)),
+        (Occur::Should, compound_match_query("gamma", "body", 3.0)),
+    ])
+    .into();
+    let mut allowed_scan = dataset.scan();
+    allowed_scan.use_scalar_index(false);
+    allowed_scan.with_row_id().filter(FILTER).unwrap();
+    let allowed_batch = allowed_scan.try_into_batch().await.unwrap();
+    let allowed_row_ids = allowed_batch[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut expected = independent_compound_fts_oracle(&dataset, &query).await;
+    expected.retain(|row_id, _| allowed_row_ids.contains(row_id));
+    let mut expected = sorted_compound_fts_oracle(expected);
+    assert!(expected.len() > LIMIT);
+    expected.truncate(LIMIT);
+
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter(FILTER)
+        .unwrap()
+        .limit(Some(LIMIT as i64), None)
+        .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "filtered cross-column search should use the cross-column scorer:\n{plan}"
+    );
+    assert!(
+        plan.contains("ScalarIndexQuery") && plan.contains("BTree"),
+        "the shared prefilter should be built from the BTree scalar index:\n{plan}"
+    );
+    assert_eq!(
+        plan.matches("ScalarIndexQuery").count(),
+        1,
+        "the cross-column scorer should have one shared scalar prefilter:\n{plan}"
+    );
+
+    let actual = scanner.try_into_batch().await.unwrap();
+    let actual = actual[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            actual[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .copied(),
+        )
+        .collect::<Vec<_>>();
+    assert_scored_rows_close("scalar_prefilter", &actual, &expected);
+}
+
+#[tokio::test]
+async fn test_cross_column_compound_tie_uses_final_row_id() {
+    let mut dataset = write_cross_column_compound_dataset().await;
+    create_fragmented_fts_index_with_order(&mut dataset, "title", true, true).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "body", true, true).await;
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("tie", "title", 1.0)),
+        (Occur::Must, compound_match_query("tiebody", "body", 1.0)),
+    ])
+    .into();
+    let expected =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &query).await);
+    assert_eq!(expected.len(), 2);
+    assert_eq!(expected[0].1, expected[1].1);
+    assert!(expected[0].0 < expected[1].0);
+
+    let actual = compound_fts_results(&dataset, query.clone(), Some(1)).await;
+    assert_scored_rows_close("equal_score_row_id_tie", &actual, &expected[..1]);
+    let plan = compound_fts_plan(&dataset, query, 1).await;
+    assert!(
+        plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "equal-score cross-column search should use the cross-column scorer:\n{plan}"
+    );
+}
+
+async fn assert_cross_column_layout_uses_fast_path(dataset: &Dataset, case_name: &str) {
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("alpha", "title", 2.0)),
+        (Occur::Must, compound_match_query("gamma", "body", 3.0)),
+    ])
+    .into();
+    assert_compound_matches_independent_oracle(dataset, case_name, &query, 2).await;
+    let plan = compound_fts_plan(dataset, query, 2).await;
+    assert!(
+        plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "{case_name} should align independent segment layouts by row address:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_cross_column_compound_handles_independent_segment_layouts() {
+    let mut reordered = write_cross_column_compound_dataset().await;
+    let fragment_ids = reordered
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    create_fragmented_fts_index_with_groups(
+        &mut reordered,
+        "title",
+        true,
+        vec![vec![fragment_ids[0]], vec![fragment_ids[1]]],
+    )
+    .await;
+    create_fragmented_fts_index_with_groups(
+        &mut reordered,
+        "body",
+        true,
+        vec![vec![fragment_ids[1]], vec![fragment_ids[0]]],
+    )
+    .await;
+    assert_cross_column_layout_uses_fast_path(&reordered, "reordered_segments").await;
+
+    let mut differently_split = write_cross_column_compound_dataset().await;
+    let fragment_ids = differently_split
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    create_fragmented_fts_index_with_groups(
+        &mut differently_split,
+        "title",
+        true,
+        vec![vec![fragment_ids[0]], vec![fragment_ids[1]]],
+    )
+    .await;
+    create_fragmented_fts_index_with_groups(
+        &mut differently_split,
+        "body",
+        true,
+        vec![fragment_ids],
+    )
+    .await;
+    assert_cross_column_layout_uses_fast_path(&differently_split, "differently_split_segments")
+        .await;
+}
+
+#[tokio::test]
+async fn test_cross_column_compound_incomplete_coverage_uses_exact_fallback() {
+    let initial = arrow_array::record_batch!(
+        ("title", Utf8, ["old alpha", "old noise"]),
+        ("body", Utf8, ["old gamma", "old noise"])
+    )
+    .unwrap();
+    let schema = initial.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "body", true).await;
+
+    let appended = arrow_array::record_batch!(
+        ("title", Utf8, ["fresh alpha"]),
+        ("body", Utf8, ["fresh gamma"])
+    )
+    .unwrap();
+    let schema = appended.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+    create_fragmented_fts_index(&mut dataset, "title", true).await;
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("fresh", "title", 1.0)),
+        (Occur::Must, compound_match_query("fresh", "body", 1.0)),
+    ])
+    .into();
+    let expected =
+        sorted_compound_fts_oracle(independent_compound_fts_oracle(&dataset, &query).await);
+    assert_eq!(expected.len(), 1, "the appended row must be the only hit");
+    let actual = compound_fts_results(&dataset, query.clone(), Some(1)).await;
+    assert_scored_rows_close("incomplete_coverage", &actual, &expected);
+
+    let plan = compound_fts_plan(&dataset, query.clone(), 1).await;
+    assert!(
+        !plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "incomplete column coverage must not use the cross-column scorer:\n{plan}"
+    );
+    assert!(
+        plan.contains("BooleanQuery"),
+        "incomplete column coverage should retain the exact fallback:\n{plan}"
+    );
+
+    let mut fast_scanner = dataset.scan();
+    fast_scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .fast_search();
+    fast_scanner.limit(Some(1), None).unwrap();
+    let fast_plan = fast_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        !fast_plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "different per-column coverage must retain field-local masking:\n{fast_plan}"
+    );
+    assert!(
+        fast_plan.contains("BooleanQuery"),
+        "different per-column coverage should retain the field-local fallback:\n{fast_plan}"
+    );
+    assert_eq!(
+        fast_scanner.try_into_batch().await.unwrap().num_rows(),
+        0,
+        "the only hit is unindexed in body and must be excluded by fast search"
+    );
+}
+
+#[tokio::test]
+async fn test_same_column_compound_fast_search_excludes_unindexed_rows() {
+    let initial = arrow_array::record_batch!(
+        ("text", Utf8, ["fresh alpha", "old noise"]),
+        ("id", Int32, [0, 1])
+    )
+    .unwrap();
+    let schema = initial.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "text", true).await;
+
+    let appended =
+        arrow_array::record_batch!(("text", Utf8, ["fresh alpha"]), ("id", Int32, [2])).unwrap();
+    let schema = appended.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("fresh", "text", 1.0)),
+        (Occur::Must, compound_match_query("alpha", "text", 1.0)),
+    ])
+    .into();
+
+    let mut hybrid_scanner = dataset.scan();
+    hybrid_scanner
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    hybrid_scanner.limit(Some(2), None).unwrap();
+    let hybrid_plan = hybrid_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        hybrid_plan.contains("HybridCompoundFtsScorer"),
+        "partial coverage should build one indexed-statistics query-local residual index:\n{hybrid_plan}"
+    );
+    assert!(
+        !hybrid_plan.contains("FlatMatchQuery"),
+        "hybrid compound scoring must not scan the residual once per leaf:\n{hybrid_plan}"
+    );
+    let hybrid = hybrid_scanner.try_into_batch().await.unwrap();
+    assert_eq!(
+        hybrid["id"].as_primitive::<Int32Type>().values(),
+        &[0, 2],
+        "approximate residual search should include the appended hit"
+    );
+
+    let empty_terms_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("", "text", 1.0)),
+        (Occur::Should, compound_match_query("   ", "text", 1.0)),
+    ])
+    .into();
+    let empty_terms_plan = compound_fts_plan(&dataset, empty_terms_query.clone(), 2).await;
+    assert!(
+        empty_terms_plan.contains("HybridCompoundFtsScorer"),
+        "the empty analyzed-term case must exercise the hybrid short circuit:\n{empty_terms_plan}"
+    );
+    let empty_results = compound_fts_results(&dataset, empty_terms_query, Some(2)).await;
+    assert!(empty_results.is_empty());
+
+    let mut filtered_scanner = dataset.scan();
+    filtered_scanner
+        .with_row_id()
+        .filter("id >= 0")
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    filtered_scanner.prefilter(true);
+    filtered_scanner.limit(Some(2), None).unwrap();
+    let filtered_plan = filtered_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        !filtered_plan.contains("HybridCompoundFtsScorer"),
+        "prefiltered residual scoring must retain the exact fallback:\n{filtered_plan}"
+    );
+
+    let phrase_query: FtsQuery = BooleanQuery::new([
+        (
+            Occur::Must,
+            PhraseQuery::new("fresh alpha".to_string())
+                .with_column(Some("text".to_string()))
+                .into(),
+        ),
+        (Occur::Must, compound_match_query("fresh", "text", 1.0)),
+    ])
+    .into();
+    let phrase_plan = compound_fts_plan(&dataset, phrase_query, 2).await;
+    assert!(
+        !phrase_plan.contains("HybridCompoundFtsScorer"),
+        "phrase position gaps are not yet supported by the residual index:\n{phrase_plan}"
+    );
+
+    let mut fast_scanner = dataset.scan();
+    fast_scanner
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap()
+        .fast_search();
+    fast_scanner.limit(Some(2), None).unwrap();
+    let fast_plan = fast_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        fast_plan.contains("CompoundFtsScorer"),
+        "fast search should keep the same-column compound scorer:\n{fast_plan}"
+    );
+    assert!(
+        !fast_plan.contains("FlatMatchQuery"),
+        "fast search must not plan a flat scan for unindexed rows:\n{fast_plan}"
+    );
+    let fast = fast_scanner.try_into_batch().await.unwrap();
+    assert_eq!(
+        fast["id"].as_primitive::<Int32Type>().values(),
+        &[0],
+        "fast search should return only the indexed hit"
+    );
+
+    let unindexed_fragment = dataset.get_fragments().last().unwrap().clone();
+    let mut unindexed_only_scanner = dataset.scan();
+    unindexed_only_scanner
+        .with_fragments(vec![unindexed_fragment.into()])
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .fast_search();
+    unindexed_only_scanner.limit(Some(2), None).unwrap();
+    let unindexed_only_plan = unindexed_only_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        !unindexed_only_plan.contains("CompoundFtsScorer"),
+        "an entirely unindexed target must not build a compound scorer:\n{unindexed_only_plan}"
+    );
+    assert_eq!(
+        unindexed_only_scanner
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_partial_compound_hybrid_prunes_same_path_different_base_rewrite() {
+    let primary = TempStrDir::default();
+    let base_one = TempStrDir::default();
+    let base_two = TempStrDir::default();
+    let initial = arrow_array::record_batch!(
+        ("text", Utf8, ["stable alpha", "stale alpha"]),
+        ("id", Int32, [0, 1])
+    )
+    .unwrap();
+    let schema = initial.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema.clone()),
+        &primary,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            initial_bases: Some(vec![
+                BasePath::new(1, base_one.to_string(), None, false),
+                BasePath::new(2, base_two.to_string(), None, false),
+            ]),
+            target_bases: Some(vec![1]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    assert!(
+        dataset
+            .get_fragments()
+            .iter()
+            .all(|fragment| { fragment.metadata().files[0].base_id == Some(1) })
+    );
+    let segment = dataset
+        .create_index_builder(
+            &["text"],
+            IndexType::Inverted,
+            &InvertedIndexParams::default().with_position(true),
+        )
+        .name("text_idx".to_string())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+    let relative_path = dataset.get_fragment(1).unwrap().metadata().files[0]
+        .path
+        .clone();
+    let replacement =
+        arrow_array::record_batch!(("text", Utf8, ["current beta"]), ("id", Int32, [1])).unwrap();
+    let replacement_path = dataset
+        .data_file_dir_for_base(Some(2))
+        .unwrap()
+        .join(relative_path.as_str());
+    let object_writer = dataset
+        .object_store(Some(2))
+        .await
+        .unwrap()
+        .create(&replacement_path)
+        .await
+        .unwrap();
+    let mut writer = lance_file::versions::v2_2::create_writer(
+        object_writer,
+        schema.as_ref().try_into().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    writer.write_batch(&replacement).await.unwrap();
+    writer.finish().await.unwrap();
+    let replacement_file = dataset
+        .create_data_file(&relative_path, Some(2))
+        .await
+        .unwrap();
+    assert_eq!(replacement_file.path, relative_path);
+    assert_eq!(replacement_file.base_id, Some(2));
+
+    let read_version = dataset.manifest.version;
+    let mut dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(1, replacement_file)],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+    dataset
+        .commit_existing_index_segments("text_idx", "text", vec![segment])
+        .await
+        .unwrap();
+    let committed = dataset
+        .load_index_by_name("text_idx")
+        .await
+        .unwrap()
+        .unwrap();
+    let coverage = committed.fragment_bitmap.as_ref().unwrap();
+    assert!(
+        coverage.contains(0),
+        "the unchanged physical file must remain covered"
+    );
+    assert!(
+        !coverage.contains(1),
+        "the same path on a different registered base must be pruned"
+    );
+
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("beta", "text", 1.0)),
+        (Occur::MustNot, compound_match_query("alpha", "text", 1.0)),
+    ])
+    .into();
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("HybridCompoundFtsScorer"),
+        "the physically pruned fragment should use hybrid residual scoring:\n{plan}"
+    );
+    let results = scanner.try_into_batch().await.unwrap();
+    assert_eq!(
+        results["id"].as_primitive::<Int32Type>().values(),
+        &[1],
+        "the current beta row must be visible without leaking stale alpha membership"
+    );
+    assert!(
+        results[SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .all(|score| score.is_finite())
+    );
+}
+
+#[tokio::test]
+async fn test_partial_compound_hybrid_uses_mixed_approximate_statistics() {
+    let initial = arrow_array::record_batch!(
+        ("text", Utf8, ["fresh alpha", "blocked fresh alpha"]),
+        ("id", Int32, [0, 1])
+    )
+    .unwrap();
+    let schema = initial.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "text", true).await;
+
+    let appended = arrow_array::record_batch!(
+        (
+            "text",
+            Utf8,
+            [
+                "fresh alpha",
+                "fresh beta",
+                "fresh alpha",
+                "fresh beta beta",
+                "fresh beta blocked"
+            ]
+        ),
+        ("id", Int32, [2, 3, 4, 5, 6])
+    )
+    .unwrap();
+    let schema = appended.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            Some(WriteParams {
+                // Keep the residual rows in separate fragments; execution may
+                // rechunk their scan batches before query-local indexing.
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    let positive: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("fresh", "text", 1.0)),
+        (Occur::Should, compound_match_query("alpha", "text", 1.0)),
+        (Occur::MustNot, compound_match_query("blocked", "text", 1.0)),
+    ])
+    .into();
+    let boost_query: FtsQuery = BoostQuery::new(
+        positive,
+        compound_match_query("alpha", "text", 1.0),
+        Some(0.25),
+    )
+    .into();
+    let partial_boost = compound_fts_results(&dataset, boost_query.clone(), Some(10)).await;
+    assert_eq!(
+        partial_boost.len(),
+        5,
+        "MUST_NOT must exclude the blocked row"
+    );
+    let multimatch_query: FtsQuery = MultiMatchQuery::try_new(
+        "fresh alpha".to_string(),
+        vec!["text".to_string(), "text".to_string()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![1.0, 2.0])
+    .unwrap()
+    .into();
+    for (query_name, query) in [
+        ("Boost", boost_query.clone()),
+        ("MultiMatch", multimatch_query.clone()),
+    ] {
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap();
+        scanner.limit(Some(10), None).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<Int32Type>().values();
+        let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+        let score_bits = ids
+            .iter()
+            .copied()
+            .zip(scores.iter().map(|score| score.to_bits()))
+            .collect::<HashMap<_, _>>();
+        let positions = ids
+            .iter()
+            .enumerate()
+            .map(|(position, row_id)| (*row_id, position))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            score_bits.get(&2),
+            score_bits.get(&4),
+            "{query_name} must preserve equal scores within the residual arm"
+        );
+        assert!(
+            positions[&2] < positions[&4],
+            "{query_name} must preserve the row-id tie break within the residual arm"
+        );
+    }
+
+    let mut indexed_only_scanner = dataset.scan();
+    indexed_only_scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(boost_query.clone()))
+        .unwrap()
+        .fast_search();
+    indexed_only_scanner.limit(Some(10), None).unwrap();
+    let indexed_only =
+        compound_fts_result_bits(&indexed_only_scanner.try_into_batch().await.unwrap())
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+    let partial_boost_bits = scored_row_bits(&partial_boost)
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    for (row_id, score) in indexed_only {
+        assert_eq!(
+            partial_boost_bits.get(&row_id),
+            Some(&score),
+            "hybrid scoring must preserve committed-index scores for indexed row {row_id}"
+        );
+    }
+    // The residual arm intentionally uses committed + query-local statistics,
+    // so its scores are not expected to equal either indexed-arm scores or a
+    // fully rebuilt index's exact global scores.
+
+    let residual_only_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_match_query("beta", "text", 1.0)),
+        (Occur::MustNot, compound_match_query("blocked", "text", 1.0)),
+    ])
+    .into();
+    let mut residual_only_scanner = dataset.scan();
+    residual_only_scanner
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(residual_only_query))
+        .unwrap();
+    residual_only_scanner.limit(Some(10), None).unwrap();
+    let residual_only_plan = residual_only_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        residual_only_plan.contains("HybridCompoundFtsScorer"),
+        "residual-only term membership must use the indexed-statistics hybrid path:\n{residual_only_plan}"
+    );
+    let residual_only = residual_only_scanner.try_into_batch().await.unwrap();
+    assert_eq!(
+        residual_only["id"].as_primitive::<Int32Type>().values(),
+        &[5, 3],
+        "residual beta TF must rank id=5 first while MUST_NOT excludes id=6"
+    );
+    let residual_only_scores = residual_only[SCORE_COL]
+        .as_primitive::<Float32Type>()
+        .values();
+    assert!(
+        residual_only_scores.iter().all(|score| score.is_finite())
+            && residual_only_scores[0] > residual_only_scores[1],
+        "residual-only terms must retain membership and use query-local TF/DF scoring"
+    );
+}
+
+#[tokio::test]
+async fn test_boolean_must_scores_sum_across_execution_paths() {
+    let batch = arrow_array::record_batch!(
+        (
+            "title",
+            Utf8,
+            [
+                "alpha beta delta",
+                "alpha alpha beta delta delta",
+                "alpha delta",
+                "beta delta",
+                "alpha beta beta delta delta delta"
+            ]
+        ),
+        (
+            "body",
+            Utf8,
+            ["gamma", "gamma gamma", "gamma", "gamma", "other"]
+        )
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    create_fragmented_fts_index(&mut dataset, "title", false).await;
+    create_fragmented_fts_index(&mut dataset, "body", false).await;
+    const LIMIT: usize = 2;
+
+    let match_query = |term: &str, column: &str, boost: f32| -> FtsQuery {
+        MatchQuery::new(term.to_owned())
+            .with_column(Some(column.to_owned()))
+            .with_boost(boost)
+            .into()
+    };
+
+    let same_column_left = match_query("alpha", "title", 2.0);
+    let same_column_right = match_query("beta", "title", 3.0);
+    let expected = expected_must_score_sum(
+        compound_fts_results(&dataset, same_column_left.clone(), None).await,
+        compound_fts_results(&dataset, same_column_right.clone(), None).await,
+    );
+    assert!(expected.len() > LIMIT);
+    let same_column_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, same_column_left.clone()),
+        (Occur::Must, same_column_right.clone()),
+    ])
+    .into();
+    let actual =
+        compound_fts_results(&dataset, same_column_query.clone(), Some(LIMIT as i64)).await;
+    assert_eq!(actual, expected[..LIMIT]);
+    let reversed_same_column_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, same_column_right),
+        (Occur::Must, same_column_left),
+    ])
+    .into();
+    assert_eq!(
+        compound_fts_results(&dataset, reversed_same_column_query, Some(LIMIT as i64)).await,
+        expected[..LIMIT]
+    );
+
+    let nested_left = match_query("alpha", "title", 2.0);
+    let nested_middle = match_query("beta", "title", 3.0);
+    let nested_right = match_query("delta", "title", 5.0);
+    let expected = expected_must_score_sum(
+        expected_must_score_sum(
+            compound_fts_results(&dataset, nested_left.clone(), None).await,
+            compound_fts_results(&dataset, nested_middle.clone(), None).await,
+        ),
+        compound_fts_results(&dataset, nested_right.clone(), None).await,
+    );
+    assert!(expected.len() > LIMIT);
+    let nested_pair: FtsQuery =
+        BooleanQuery::new([(Occur::Must, nested_left), (Occur::Must, nested_middle)]).into();
+    let nested_query: FtsQuery =
+        BooleanQuery::new([(Occur::Must, nested_pair), (Occur::Must, nested_right)]).into();
+    assert_eq!(
+        compound_fts_results(&dataset, nested_query, Some(LIMIT as i64)).await,
+        expected[..LIMIT]
+    );
+    let reversed_nested_pair: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("beta", "title", 3.0)),
+        (Occur::Must, match_query("alpha", "title", 2.0)),
+    ])
+    .into();
+    let reversed_nested_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("delta", "title", 5.0)),
+        (Occur::Must, reversed_nested_pair),
+    ])
+    .into();
+    assert_eq!(
+        compound_fts_results(&dataset, reversed_nested_query, Some(LIMIT as i64)).await,
+        expected[..LIMIT]
+    );
+
+    let mut scanner = dataset.scan();
+    scanner
+        .full_text_search(FullTextSearchQuery::new_query(same_column_query))
+        .unwrap();
+    scanner.limit(Some(LIMIT as i64), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "same-column MUST should exercise the composable scorer:\n{plan}"
+    );
+
+    let cross_column_left = match_query("alpha", "title", 2.0);
+    let cross_column_right = match_query("gamma", "body", 3.0);
+    let expected = expected_must_score_sum(
+        compound_fts_results(&dataset, cross_column_left.clone(), None).await,
+        compound_fts_results(&dataset, cross_column_right.clone(), None).await,
+    );
+    assert!(expected.len() > LIMIT);
+    let cross_column_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, cross_column_left.clone()),
+        (Occur::Must, cross_column_right.clone()),
+    ])
+    .into();
+    let actual =
+        compound_fts_results(&dataset, cross_column_query.clone(), Some(LIMIT as i64)).await;
+    assert_eq!(actual, expected[..LIMIT]);
+    let reversed_cross_column_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, cross_column_right),
+        (Occur::Must, cross_column_left),
+    ])
+    .into();
+    assert_eq!(
+        compound_fts_results(&dataset, reversed_cross_column_query, Some(LIMIT as i64)).await,
+        expected[..LIMIT]
+    );
+
+    let mut scanner = dataset.scan();
+    scanner
+        .full_text_search(FullTextSearchQuery::new_query(cross_column_query))
+        .unwrap();
+    scanner.limit(Some(LIMIT as i64), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "cross-column MUST should exercise the cross-column scorer:\n{plan}"
+    );
+    assert!(
+        !plan.contains("HashJoinExec"),
+        "cross-column MUST should not materialize an intermediate hash join:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_nested_multimatch_limit_propagation() {
+    let dataset = compound_fts_dataset().await;
+
+    let must_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_multimatch_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    let must_results = compound_fts_results(&dataset, must_query.clone(), None).await;
+    assert!(
+        must_results
+            .windows(2)
+            .any(|rows| rows[0].1 == rows[1].1 && rows[0].0 < rows[1].0),
+        "the exhaustive result should include a deterministic score tie"
+    );
+    assert_compound_matches_independent_oracle(&dataset, "nested_multimatch_must", &must_query, 2)
+        .await;
+    let mut staged_scanner = dataset.scan();
+    staged_scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(must_query.clone()))
+        .unwrap();
+    staged_scanner.limit(Some(2), None).unwrap();
+    staged_scanner.try_into_batch().await.unwrap();
+
+    let should_query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, compound_multimatch_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    assert_compound_matches_independent_oracle(
+        &dataset,
+        "nested_multimatch_should",
+        &should_query,
+        2,
+    )
+    .await;
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(should_query))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains(CROSS_COLUMN_COMPOUND_FTS_SCORER),
+        "cross-column compound FTS should use the cross-column scorer:\n{plan}"
+    );
+    assert!(
+        !plan.contains("HashJoinExec"),
+        "cross-column compound FTS should not materialize intermediate joins:\n{plan}"
+    );
+
+    let boost_query: FtsQuery = BoostQuery::new(
+        compound_multimatch_query(),
+        compound_match_query("penalty", "body", 100.0),
+        Some(1.0),
+    )
+    .into();
+    assert_compound_matches_independent_oracle(
+        &dataset,
+        "nested_multimatch_boost",
+        &boost_query,
+        2,
+    )
+    .await;
+
+    let multimatch_query = compound_multimatch_query();
+    assert_compound_matches_independent_oracle(
+        &dataset,
+        "cross_column_multimatch",
+        &multimatch_query,
+        1,
+    )
+    .await;
+}
+
+/// `combined_fields` is planned recursively like every other FTS node, so it owes
+/// a compound parent the same contract a nested `MultiMatch` does (see
+/// `test_nested_multimatch_limit_propagation`): `FtsSearchParams::limit` decides
+/// completeness, and the ambient scanner limit must not reach the child. A child
+/// that applied the scanner limit itself would drop candidates before the parent
+/// finished composing scores.
+#[tokio::test]
+async fn test_nested_combined_fields_limit_propagation() {
+    let dataset = compound_fts_dataset().await;
+
+    let must_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_combined_fields_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    let must_results = compound_fts_results(&dataset, must_query.clone(), None).await;
+    assert!(
+        must_results
+            .windows(2)
+            .any(|rows| rows[0].1 == rows[1].1 && rows[0].0 < rows[1].0),
+        "the exhaustive result should include a deterministic score tie"
+    );
+    assert_compound_fts_top_k(&dataset, must_query, 2).await;
+
+    let should_query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, compound_combined_fields_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    assert_compound_fts_top_k(&dataset, should_query, 2).await;
+
+    let boost_query: FtsQuery = BoostQuery::new(
+        compound_combined_fields_query(),
+        compound_match_query("penalty", "body", 100.0),
+        Some(1.0),
+    )
+    .into();
+    assert_compound_fts_top_k(&dataset, boost_query, 2).await;
+
+    assert_compound_fts_top_k(&dataset, compound_combined_fields_query(), 1).await;
+}
+
+#[tokio::test]
+async fn test_same_column_compound_scorer_is_exact_and_bounded() {
+    let batch = arrow_array::record_batch!((
+        "text",
+        Utf8,
+        [
+            "common",
+            "common filler filler filler",
+            "irrelevant",
+            "common tie",
+            "common tie",
+            "common filler"
+        ]
+    ))
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "text", true).await;
+
+    let match_query = |term: &str| {
+        MatchQuery::new(term.to_owned())
+            .with_column(Some("text".to_owned()))
+            .into()
+    };
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("common")),
+        (
+            Occur::Should,
+            BoostQuery::new(match_query("tie"), match_query("filler"), Some(0.5)).into(),
+        ),
+        (
+            Occur::Should,
+            PhraseQuery::new("common tie".to_owned())
+                .with_column(Some("text".to_owned()))
+                .into(),
+        ),
+        (Occur::MustNot, match_query("irrelevant")),
+    ])
+    .into();
+
+    assert_compound_fts_top_k(&dataset, query.clone(), 2).await;
+
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "same-column compound FTS should use the scorer tree:\n{plan}"
+    );
+    assert!(
+        !plan.contains("HashJoinExec"),
+        "same-column compound FTS should not materialize intermediate joins:\n{plan}"
+    );
+
+    let same_column_multimatch: FtsQuery = MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["text".to_owned(), "text".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![1.0, 0.5])
+    .unwrap()
+    .into();
+    assert_compound_fts_top_k(&dataset, same_column_multimatch.clone(), 2).await;
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(same_column_multimatch))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "bounded same-column MultiMatch should use posting-backed scorers:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_pure_should_maxscore_is_exact_across_fragments() {
+    let batch = arrow_array::record_batch!((
+        "text",
+        Utf8,
+        [
+            "alpha beta rare blocked",
+            "alpha beta rare",
+            "alpha beta",
+            "alpha gamma",
+            "beta gamma",
+            "alpha beta rare",
+            "alpha beta",
+            "gamma",
+            "alpha beta rare",
+            "alpha beta",
+            "beta",
+            "alpha"
+        ]
+    ))
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 4);
+    create_fragmented_fts_index_with_order(&mut dataset, "text", true, true).await;
+
+    let match_query = |term: &str, boost: f32| {
+        MatchQuery::new(term.to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_boost(boost)
+            .into()
+    };
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, match_query("alpha", 0.25)),
+        (Occur::Should, match_query("beta", 0.25)),
+        (Occur::Should, match_query("rare", 4.0)),
+        (
+            Occur::Should,
+            PhraseQuery::new("alpha beta".to_owned())
+                .with_column(Some("text".to_owned()))
+                .into(),
+        ),
+        (Occur::MustNot, match_query("blocked", 1.0)),
+    ])
+    .into();
+
+    let exhaustive = compound_fts_results(&dataset, query.clone(), None).await;
+    assert!(!exhaustive.iter().any(|(row_id, _)| *row_id == 0));
+    assert!(exhaustive.len() >= 3);
+    assert!(
+        exhaustive[..3]
+            .iter()
+            .all(|(_, score)| *score == exhaustive[0].1)
+            && exhaustive[..3].windows(2).all(|rows| rows[0].0 < rows[1].0),
+        "the top three identical rows should tie in ascending row-id order"
+    );
+    let limited = compound_fts_results(&dataset, query.clone(), Some(2)).await;
+    assert_eq!(limited, exhaustive[..2]);
+
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    scanner.try_into_batch().await.unwrap();
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        stats.all_counts.get(PARTITIONS_SEARCHED_METRIC),
+        Some(&(4 * 5)),
+        "four index partitions should be searched once for each of five query leaves"
+    );
+
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "same-column pure SHOULD should use the compound scorer:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_compound_phrase_confirmation_short_circuit_is_exact() {
+    let texts = (0..100)
+        .map(|row| {
+            if row % 10 == 0 {
+                "high cost phrase check cheap reject bonus"
+            } else if row % 5 == 0 {
+                "high cost phrase check cheap reject"
+            } else {
+                "high cost phrase check cheap filler reject"
+            }
+        })
+        .collect::<Vec<_>>();
+    let batch = arrow_array::record_batch!(("text", Utf8, texts)).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 25,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 4);
+    create_fragmented_fts_index(&mut dataset, "text", true).await;
+
+    let phrase_query = |terms: &str| -> FtsQuery {
+        PhraseQuery::new(terms.to_owned())
+            .with_column(Some("text".to_owned()))
+            .into()
+    };
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, phrase_query("high cost phrase check")),
+        (Occur::Must, phrase_query("cheap reject")),
+    ])
+    .into();
+    assert_compound_fts_top_k(&dataset, query.clone(), 10).await;
+
+    let nested: FtsQuery = BooleanQuery::new([
+        (Occur::Must, query.clone()),
+        (Occur::Should, compound_match_query("bonus", "text", 1.0)),
+    ])
+    .into();
+    assert_compound_fts_top_k(&dataset, nested, 10).await;
+}
+
+#[tokio::test]
+async fn test_compound_tie_uses_resolved_row_id() {
+    let batch = arrow_array::record_batch!(("text", Utf8, vec!["common"; 384])).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 256,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index_with_order(&mut dataset, "text", false, true).await;
+
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["text".to_owned(), "text".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    scanner.limit(Some(1), None).unwrap();
+    let limited = scanner.try_into_batch().await.unwrap();
+    let limited_row_id = limited[ROW_ID].as_primitive::<UInt64Type>().value(0);
+
+    let exhaustive = compound_fts_results(&dataset, query.clone(), None).await;
+    assert_eq!(limited_row_id, exhaustive[0].0);
+    assert_eq!(exhaustive.len(), 384);
+}
+
+pub(super) fn nested_fts_batch(
+    ids: Vec<u64>,
+    a_values: Vec<Option<&str>>,
+    b_values: Vec<Option<&str>>,
+) -> RecordBatch {
+    let a_values = Arc::new(StringArray::from(a_values)) as ArrayRef;
+    let b_values = Arc::new(StringArray::from(b_values)) as ArrayRef;
+    let struct_array = StructArray::from(vec![
+        (
+            Arc::new(Field::new("a", DataType::Utf8, true)),
+            a_values.clone(),
+        ),
+        (
+            Arc::new(Field::new("b", DataType::Utf8, true)),
+            b_values.clone(),
+        ),
+    ]);
+    let struct_type = struct_array.data_type().clone();
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("s", struct_type, true),
+        ])),
+        vec![
+            Arc::new(UInt64Array::from(ids)) as ArrayRef,
+            Arc::new(struct_array) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+async fn nested_fts_result_ids(dataset: &Dataset, query: FullTextSearchQuery) -> Vec<u64> {
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut ids = batch["id"].as_primitive::<UInt64Type>().values().to_vec();
+    ids.sort_unstable();
+    ids
+}
+
+#[tokio::test]
+async fn test_fts_on_nested_fields() {
+    let batch = nested_fts_batch(
+        vec![0, 1, 2, 3],
+        vec![
+            Some("lance nested alpha"),
+            Some("plain text"),
+            None,
+            Some("phrase target here"),
+        ],
+        vec![
+            Some("metadata only"),
+            Some("database nested beta"),
+            Some("lance beta"),
+            Some("other"),
+        ],
+    );
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(batches, &test_uri, None).await.unwrap();
+
+    dataset
+        .create_index(
+            &["s.a"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default().with_position(true),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["s.b"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let indices = dataset.load_indices().await.unwrap();
+    let indexed_fields = indices
+        .iter()
+        .map(|index| dataset.schema().field_path(index.fields[0]).unwrap())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        indexed_fields,
+        HashSet::from(["s.a".to_string(), "s.b".to_string()])
+    );
+
+    let query = FullTextSearchQuery::new_query(FtsQuery::Match(
+        MatchQuery::new("alpha".to_owned()).with_column(Some("s.a".to_owned())),
+    ));
+    assert_eq!(nested_fts_result_ids(&dataset, query).await, vec![0]);
+
+    let query = FullTextSearchQuery::new_query(FtsQuery::Match(
+        MatchQuery::new("beta".to_owned()).with_column(Some("s.b".to_owned())),
+    ));
+    assert_eq!(nested_fts_result_ids(&dataset, query).await, vec![1, 2]);
+
+    assert_eq!(
+        nested_fts_result_ids(&dataset, FullTextSearchQuery::new("lance".to_owned())).await,
+        vec![0, 2]
+    );
+
+    let query = FullTextSearchQuery::new_query(FtsQuery::MultiMatch(MultiMatchQuery {
+        match_queries: vec![
+            MatchQuery::new("nested".to_owned()).with_column(Some("s.a".to_owned())),
+            MatchQuery::new("nested".to_owned()).with_column(Some("s.b".to_owned())),
+        ],
+    }));
+    assert_eq!(nested_fts_result_ids(&dataset, query).await, vec![0, 1]);
+
+    let query = FullTextSearchQuery::new_query(
+        PhraseQuery::new("phrase target".to_owned())
+            .with_column(Some("s.a".to_owned()))
+            .into(),
+    );
+    assert_eq!(nested_fts_result_ids(&dataset, query).await, vec![3]);
+
+    let append_batch = nested_fts_batch(
+        vec![4, 5],
+        vec![Some("fresh lance append"), Some("plain append")],
+        vec![Some("other"), Some("fresh beta append")],
+    );
+    let schema = append_batch.schema();
+    let batches = RecordBatchIterator::new(vec![append_batch].into_iter().map(Ok), schema);
+    dataset.append(batches, None).await.unwrap();
+
+    assert_eq!(
+        nested_fts_result_ids(&dataset, FullTextSearchQuery::new("fresh".to_owned())).await,
+        vec![4, 5]
+    );
+}
+
+#[tokio::test]
+async fn test_fts_unindexed_data() {
+    let params = InvertedIndexParams::default();
+    let title_col = StringArray::from(vec!["title hello", "title lance", "title common"]);
+    let content_col =
+        StringArray::from(vec!["content world", "content database", "content common"]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            Field::new("title", title_col.data_type().to_owned(), false),
+            Field::new("content", title_col.data_type().to_owned(), false),
+        ])
+        .into(),
+        vec![
+            Arc::new(title_col) as ArrayRef,
+            Arc::new(content_col) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, "memory://test.lance", None)
+        .await
+        .unwrap();
+    dataset
+        .create_index(&["title"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("title".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 3);
+
+    // write new data
+    let title_col = StringArray::from(vec!["new title"]);
+    let content_col = StringArray::from(vec!["new content"]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            Field::new("title", title_col.data_type().to_owned(), false),
+            Field::new("content", title_col.data_type().to_owned(), false),
+        ])
+        .into(),
+        vec![
+            Arc::new(title_col) as ArrayRef,
+            Arc::new(content_col) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    dataset.append(batches, None).await.unwrap();
+
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("title".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 4);
+
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("new".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RestrictedMatchDomain {
+    Unrestricted,
+    Prefilter,
+    IndexedFragment,
+    Filter(&'static str),
+    Fragments(&'static [usize]),
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RawMatchCorpus {
+    documents: usize,
+    total_tokens: usize,
+    average_length: f64,
+    document_lengths: Vec<usize>,
+    document_frequencies: Vec<usize>,
+    query_terms: Vec<String>,
+}
+
+fn raw_match_oracle(corpus: &[(i32, &str)], query: &str) -> (RawMatchCorpus, Vec<(i32, f64)>) {
+    // Derive every statistic from raw strings, without calling a production
+    // tokenizer or scorer. Fixture words need no stemming or normalization.
+    let documents: Vec<_> = corpus
+        .iter()
+        .map(|(id, text)| (*id, text.split_whitespace().collect::<Vec<_>>()))
+        // Empty analyzed documents do not contribute to BM25 corpus statistics.
+        .filter(|(_, tokens)| !tokens.is_empty())
+        .collect();
+    let query_terms: Vec<_> = query.split_whitespace().map(str::to_owned).collect();
+    let document_frequencies: Vec<_> = query_terms
+        .iter()
+        .map(|term| {
+            documents
+                .iter()
+                .filter(|(_, document)| document.contains(&term.as_str()))
+                .count()
+        })
+        .collect();
+    let total_tokens: usize = documents.iter().map(|(_, tokens)| tokens.len()).sum();
+    let average_length = if documents.is_empty() {
+        0.0
+    } else {
+        total_tokens as f64 / documents.len() as f64
+    };
+    let mut scores: Vec<(i32, f64)> = documents
+        .iter()
+        .filter_map(|(id, document)| {
+            let score = query_terms
+                .iter()
+                .zip(&document_frequencies)
+                .filter_map(|(term, document_frequency)| {
+                    let frequency = document
+                        .iter()
+                        .filter(|token| **token == term.as_str())
+                        .count() as f64;
+                    if frequency == 0.0 {
+                        return None;
+                    }
+                    let inverse_document_frequency =
+                        ((documents.len() as f64 - *document_frequency as f64 + 0.5)
+                            / (*document_frequency as f64 + 0.5)
+                            + 1.0)
+                            .ln();
+                    Some(
+                        inverse_document_frequency * frequency * (1.2 + 1.0)
+                            / (frequency
+                                + 1.2
+                                    * (1.0 - 0.75 + 0.75 * document.len() as f64 / average_length)),
+                    )
+                })
+                .sum::<f64>();
+            (score > 0.0).then_some((*id, score))
+        })
+        .collect();
+    scores.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    (
+        RawMatchCorpus {
+            documents: documents.len(),
+            total_tokens,
+            average_length,
+            document_lengths: documents.iter().map(|(_, tokens)| tokens.len()).collect(),
+            document_frequencies,
+            query_terms,
+        },
+        scores,
+    )
+}
+
+/// A phrase scores as the Match of its terms, so the oracle keeps the Match scores
+/// of the rows that hold the terms adjacently and in order.
+fn raw_phrase_oracle(corpus: &[(i32, &str)], phrase: &str) -> (RawMatchCorpus, Vec<(i32, f64)>) {
+    let terms: Vec<_> = phrase.split_whitespace().collect();
+    let (corpus_stats, mut scores) = raw_match_oracle(corpus, phrase);
+    scores.retain(|(id, _)| {
+        corpus.iter().any(|(row, text)| {
+            row == id
+                && text
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(terms.len())
+                    .any(|window| window == terms.as_slice())
+        })
+    });
+    (corpus_stats, scores)
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RestrictedMatchObservation {
+    stage: &'static str,
+    limit: Option<i64>,
+    plan: std::result::Result<String, String>,
+    rows: std::result::Result<Vec<(i32, f32)>, String>,
+    scan_stats: Option<serde_json::Value>,
+}
+
+async fn restricted_match_observation(
+    dataset: &Dataset,
+    domain: RestrictedMatchDomain,
+    stage: &'static str,
+    limit: Option<i64>,
+    terms: &str,
+) -> RestrictedMatchObservation {
+    let query = MatchQuery::new(terms.to_owned())
+        .with_column(Some("text".to_owned()))
+        .with_fuzziness(Some(0))
+        .with_operator(Operator::Or)
+        .with_document_granularity(DocumentGranularity::Row);
+    restricted_fts_observation(dataset, domain, stage, limit, query.into()).await
+}
+
+async fn restricted_fts_observation(
+    dataset: &Dataset,
+    domain: RestrictedMatchDomain,
+    stage: &'static str,
+    limit: Option<i64>,
+    query: FtsQuery,
+) -> RestrictedMatchObservation {
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .limit(limit, None)
+        .unwrap();
+    match domain {
+        RestrictedMatchDomain::Unrestricted => {}
+        RestrictedMatchDomain::Prefilter => {
+            scanner.prefilter(true).filter("id < 2").unwrap();
+        }
+        RestrictedMatchDomain::IndexedFragment => {
+            scanner.with_fragments(vec![dataset.get_fragments()[0].clone().into()]);
+        }
+        RestrictedMatchDomain::Filter(filter) => {
+            scanner.prefilter(true).filter(filter).unwrap();
+        }
+        RestrictedMatchDomain::Fragments(positions) => {
+            let fragments = dataset.get_fragments();
+            scanner.with_fragments(
+                positions
+                    .iter()
+                    .map(|position| fragments[*position].clone().into())
+                    .collect(),
+            );
+        }
+    }
+    let plan = tokio::time::timeout(Duration::from_secs(10), scanner.explain_plan(false))
+        .await
+        .map_err(|_| "restricted Match planning timed out after 10 seconds".to_owned())
+        .and_then(|result| result.map_err(|error| error.to_string()));
+    let batch = tokio::time::timeout(Duration::from_secs(10), scanner.try_into_batch())
+        .await
+        .map_err(|_| "restricted Match execution timed out after 10 seconds".to_owned())
+        .and_then(|result| result.map_err(|error| error.to_string()));
+    let rows = batch.and_then(|batch| {
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|column| column.as_primitive_opt::<Int32Type>())
+            .ok_or_else(|| "restricted Match result is missing an Int32 id column".to_owned())?;
+        let scores = batch
+            .column_by_name(SCORE_COL)
+            .and_then(|column| column.as_primitive_opt::<Float32Type>())
+            .ok_or_else(|| {
+                "restricted Match result is missing a Float32 score column".to_owned()
+            })?;
+        Ok(ids
+            .values()
+            .iter()
+            .copied()
+            .zip(scores.values().iter().copied())
+            .collect())
+    });
+    let scan_stats = collected_stats.lock().unwrap().take().map(|stats| {
+        serde_json::json!({
+            "iops": stats.iops,
+            "requests": stats.requests,
+            "bytes_read": stats.bytes_read,
+            "all_counts": stats.all_counts,
+            "all_times": stats.all_times,
+        })
+    });
+    RestrictedMatchObservation {
+        stage,
+        limit,
+        plan,
+        rows,
+        scan_stats,
+    }
+}
+
+const RESTRICTED_MATCH_CORPUS: [(i32, &str); 8] = [
+    (0, "alpha"),
+    (1, "beta"),
+    (2, "beta gamma delta"),
+    (3, "alpha"),
+    (4, "alpha alpha"),
+    (5, "epsilon"),
+    (6, "alpha beta"),
+    (7, "alpha"),
+];
+
+fn restricted_match_fragments(layout: &[&[usize]]) -> Vec<Vec<(i32, Option<&'static str>)>> {
+    layout
+        .iter()
+        .map(|positions| {
+            positions
+                .iter()
+                .map(|position| {
+                    let (id, text) = RESTRICTED_MATCH_CORPUS[*position];
+                    (id, Some(text))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+async fn create_restricted_match_index(dataset: &mut Dataset) {
+    let params = InvertedIndexParams::default()
+        .base_tokenizer("whitespace".to_owned())
+        .stem(false)
+        .remove_stop_words(false);
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+}
+
+async fn restricted_match_dataset(
+    fragments: &[Vec<(i32, Option<&str>)>],
+    indexed_fragments: usize,
+    stable_row_ids: bool,
+) -> Dataset {
+    assert!(!fragments.is_empty() && indexed_fragments <= fragments.len());
+    let mut batches = fragments.iter().map(|rows| {
+        arrow_array::record_batch!(
+            (
+                "id",
+                Int32,
+                rows.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+            ),
+            (
+                "text",
+                Utf8,
+                rows.iter().map(|(_, text)| *text).collect::<Vec<_>>()
+            )
+        )
+        .unwrap()
+    });
+    let initial = batches.next().unwrap();
+    let schema = initial.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for (position, batch) in batches.enumerate() {
+        if position + 1 == indexed_fragments {
+            create_restricted_match_index(&mut dataset).await;
+        }
+        let schema = batch.schema();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    if indexed_fragments == fragments.len() {
+        create_restricted_match_index(&mut dataset).await;
+    }
+    assert_eq!(dataset.get_fragments().len(), fragments.len());
+    dataset
+}
+
+async fn restricted_match_maintenance_observations(
+    dataset: &mut Dataset,
+    domain: RestrictedMatchDomain,
+    terms: &str,
+    limits: &[Option<i64>],
+) -> Vec<RestrictedMatchObservation> {
+    let mut observations = Vec::with_capacity(limits.len() * 2);
+    for stage in ["before_optimize", "after_optimize"] {
+        if stage == "after_optimize" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        for limit in limits {
+            observations
+                .push(restricted_match_observation(dataset, domain, stage, *limit, terms).await);
+        }
+    }
+    observations
+}
+
+fn assert_restricted_match_oracle(
+    name: &str,
+    corpus: &[(i32, &str)],
+    domain: RestrictedMatchDomain,
+    candidate_ids: &[i32],
+    observations: &[RestrictedMatchObservation],
+) {
+    assert_restricted_oracle(
+        name,
+        corpus,
+        raw_match_oracle(corpus, "alpha beta"),
+        domain,
+        candidate_ids,
+        observations,
+    );
+}
+
+fn assert_restricted_oracle(
+    name: &str,
+    corpus: &[(i32, &str)],
+    (corpus_stats, mut expected): (RawMatchCorpus, Vec<(i32, f64)>),
+    domain: RestrictedMatchDomain,
+    candidate_ids: &[i32],
+    observations: &[RestrictedMatchObservation],
+) {
+    expected.retain(|(id, _)| candidate_ids.contains(id));
+    let evidence = serde_json::json!({
+        "case": name,
+        "raw_rows": corpus,
+        "domain": format!("{domain:?}"),
+        "candidate_ids": candidate_ids,
+        "corpus": corpus_stats,
+        "expected": expected,
+        "observations": observations,
+    });
+    for observation in observations {
+        assert!(observation.plan.is_ok(), "planning failed: {evidence:#}");
+        let mut actual = observation
+            .rows
+            .as_ref()
+            .unwrap_or_else(|error| panic!("execution failed: {error}; {evidence:#}"))
+            .clone();
+        let mut expected = expected.clone();
+        if let Some(limit) = observation.limit {
+            expected.truncate(limit as usize);
+        }
+        // Append ordering can change physical row IDs of tied residual rows.
+        // All-hit assertions compare the requested logical IDs and their scores.
+        actual.sort_by_key(|(id, _)| *id);
+        expected.sort_by_key(|(id, _)| *id);
+        assert_eq!(actual.len(), expected.len(), "wrong hits: {evidence:#}");
+        for ((actual_id, actual_score), (expected_id, expected_score)) in
+            actual.iter().zip(&expected)
+        {
+            assert_eq!(actual_id, expected_id, "wrong candidate: {evidence:#}");
+            assert!(
+                (f64::from(*actual_score) - expected_score).abs() < 1e-5,
+                "wrong global corpus score: {evidence:#}"
+            );
+        }
+    }
+}
+
+fn assert_restricted_match_membership(
+    name: &str,
+    expected_ids: &[i32],
+    observations: &[RestrictedMatchObservation],
+) {
+    let evidence = serde_json::json!({
+        "case": name,
+        "expected_ids": expected_ids,
+        "observations": observations,
+    });
+    let mut expected_ids = expected_ids.to_vec();
+    expected_ids.sort_unstable();
+    for observation in observations {
+        assert!(observation.plan.is_ok(), "planning failed: {evidence:#}");
+        let rows = observation
+            .rows
+            .as_ref()
+            .unwrap_or_else(|error| panic!("execution failed: {error}; {evidence:#}"));
+        let mut actual_ids: Vec<_> = rows.iter().map(|(id, _)| *id).collect();
+        actual_ids.sort_unstable();
+        assert_eq!(actual_ids, expected_ids, "wrong candidates: {evidence:#}");
+        assert!(
+            rows.iter().all(|(_, score)| score.is_finite()),
+            "non-finite score: {evidence:#}"
+        );
+    }
+}
+
+#[rstest]
+#[case::reported(&["alpha", "beta"])]
+#[case::non_tie(&["alpha", "beta", "beta gamma delta"])]
+#[tokio::test]
+async fn test_fts_9058_restricted_match_corpus_stability(
+    #[case] indexed_texts: &[&str],
+    #[values(
+        RestrictedMatchDomain::Prefilter,
+        RestrictedMatchDomain::IndexedFragment
+    )]
+    domain: RestrictedMatchDomain,
+    #[values(false, true)] use_stable_row_id: bool,
+) {
+    // Based on the filter and fragment cases reported by sbrunk and
+    // lance-gatekeeper[bot] in https://github.com/lance-format/lance/issues/9058.
+    let initial = arrow_array::record_batch!(
+        ("text", Utf8, indexed_texts.to_vec()),
+        (
+            "id",
+            Int32,
+            (0..indexed_texts.len() as i32).collect::<Vec<_>>()
+        )
+    )
+    .unwrap();
+    let schema = initial.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![initial].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: use_stable_row_id,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let params = InvertedIndexParams::default()
+        .base_tokenizer("whitespace".to_owned())
+        .stem(false)
+        .remove_stop_words(false);
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let first_appended_id = indexed_texts.len() as i32;
+    let appended = arrow_array::record_batch!(
+        ("text", Utf8, vec!["alpha"; 10]),
+        (
+            "id",
+            Int32,
+            (first_appended_id..first_appended_id + 10).collect::<Vec<_>>()
+        )
+    )
+    .unwrap();
+    let schema = appended.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let mut corpus = indexed_texts.to_vec();
+    corpus.extend(["alpha"; 10]);
+    let raw_rows: Vec<_> = corpus
+        .iter()
+        .enumerate()
+        .map(|(id, text)| (id as i32, *text))
+        .collect();
+    let (corpus_stats, mut expected) = raw_match_oracle(&raw_rows, "alpha beta");
+    let candidate_count = match domain {
+        RestrictedMatchDomain::Prefilter => 2,
+        RestrictedMatchDomain::IndexedFragment => indexed_texts.len(),
+        _ => unreachable!("initial fixtures only use the two reported restrictions"),
+    };
+    expected.retain(|(id, _)| (*id as usize) < candidate_count);
+    assert_eq!(expected[0].0, 1, "the full corpus must prefer beta");
+
+    // Collect both sides of maintenance before comparing scores, so a failing
+    // baseline still records both plans and the actual change in results.
+    let mut observations = Vec::with_capacity(4);
+    for stage in ["before_optimize", "after_optimize"] {
+        if stage == "after_optimize" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        for limit in [Some(1), None] {
+            observations.push(
+                restricted_match_observation(&dataset, domain, stage, limit, "alpha beta").await,
+            );
+        }
+    }
+    let evidence = serde_json::json!({
+        "indexed_texts": indexed_texts,
+        "appended_texts": vec!["alpha"; 10],
+        "domain": format!("{domain:?}"),
+        "stable_row_ids": use_stable_row_id,
+        "corpus": corpus_stats,
+        "expected": expected,
+        "observations": observations,
+    });
+    for observation in &observations {
+        assert!(
+            observation.plan.is_ok(),
+            "restricted Match planning failed: {evidence:#}"
+        );
+        let rows = observation.rows.as_ref().unwrap_or_else(|error| {
+            panic!("restricted Match execution failed: {error}; {evidence:#}")
+        });
+        let expected = match observation.limit {
+            Some(limit) => &expected[..limit as usize],
+            None => &expected,
+        };
+        assert_eq!(
+            rows.len(),
+            expected.len(),
+            "candidate membership changed: {evidence:#}"
+        );
+        for ((actual_id, actual_score), (expected_id, expected_score)) in rows.iter().zip(expected)
+        {
+            assert_eq!(
+                actual_id, expected_id,
+                "wrong ranked candidate: {evidence:#}"
+            );
+            assert!(
+                (f64::from(*actual_score) - expected_score).abs() < 1e-5,
+                "score differs from the global corpus oracle: {evidence:#}"
+            );
+        }
+        if observation.stage == "before_optimize" && observation.limit == Some(1) {
+            // GlobalLimit can finish before its child reaches EOF. The scanner's
+            // completion callback must still see the residual corpus read metrics.
+            let rows_scanned = observation
+                .scan_stats
+                .as_ref()
+                .and_then(|stats| stats["all_counts"]["rows_scanned"].as_u64())
+                .expect("restricted Match callback is missing row-read metrics");
+            assert!(
+                rows_scanned >= 10,
+                "residual corpus reads were hidden: {evidence:#}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_fts_9058_restricted_match_with_multiple_segments_and_residual() {
+    let fragments = restricted_match_fragments(&[&[0, 1], &[2, 3], &[4, 5, 6, 7]]);
+    let mut dataset = restricted_match_dataset(&fragments, 0, true).await;
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    create_fragmented_fts_index_with_groups(
+        &mut dataset,
+        "text",
+        false,
+        fragment_ids[..2]
+            .iter()
+            .map(|fragment_id| vec![*fragment_id])
+            .collect(),
+    )
+    .await;
+
+    let observations = restricted_match_maintenance_observations(
+        &mut dataset,
+        RestrictedMatchDomain::Prefilter,
+        "alpha beta",
+        &[None],
+    )
+    .await;
+    assert_contains!(observations[0].plan.as_ref().unwrap(), "MatchCorpus");
+    assert_restricted_match_oracle(
+        "9058-multiple-segments-with-residual.json",
+        &RESTRICTED_MATCH_CORPUS,
+        RestrictedMatchDomain::Prefilter,
+        &[0, 1],
+        &observations,
+    );
+}
+
+#[rstest]
+#[case::top(0)]
+#[case::offset(1)]
+#[tokio::test]
+async fn test_fts_9058_default_match_uses_global_corpus(#[case] offset: i64) {
+    let raw_rows: Vec<_> = [(0, "alpha"), (1, "beta")]
+        .into_iter()
+        .chain((2..12).map(|id| (id, "alpha")))
+        .collect();
+    let fragments = [&raw_rows[..2], &raw_rows[2..]]
+        .map(|rows| rows.iter().map(|(id, text)| (*id, Some(*text))).collect());
+    let mut dataset = restricted_match_dataset(&fragments, 1, false).await;
+    let (_, mut expected) = raw_match_oracle(&raw_rows, "alpha beta");
+    expected.retain(|(id, _)| *id < 2);
+    let mut observations = Vec::with_capacity(2);
+    for stage in ["before_optimize", "after_optimize"] {
+        if stage == "after_optimize" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        // Exercise the reported query without explicitly resolving fuzziness
+        // or document granularity, including the scanner's top-k offset.
+        let query = MatchQuery::new("alpha beta".to_owned()).with_column(Some("text".to_owned()));
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(query.into()))
+            .unwrap()
+            .prefilter(true)
+            .filter("id < 2")
+            .unwrap()
+            .limit(Some(1), Some(offset))
+            .unwrap();
+        let plan = tokio::time::timeout(Duration::from_secs(10), scanner.explain_plan(false))
+            .await
+            .unwrap()
+            .unwrap();
+        let batch = tokio::time::timeout(Duration::from_secs(10), scanner.try_into_batch())
+            .await
+            .unwrap()
+            .unwrap();
+        observations.push((stage, plan, batch));
+    }
+    for (stage, plan, batch) in observations {
+        if stage == "before_optimize" {
+            assert_contains!(&plan, "MatchCorpus");
+        }
+        assert_eq!(batch.num_rows(), 1, "{stage}: {plan}");
+        let (expected_id, expected_score) = expected[offset as usize];
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().value(0),
+            expected_id
+        );
+        let score = batch[SCORE_COL].as_primitive::<Float32Type>().value(0);
+        assert!(
+            (f64::from(score) - expected_score).abs() < 1e-5,
+            "{stage}: score {score} differs from {expected_score}; {plan}"
+        );
+    }
+}
+
+#[rstest]
+#[case::mixed_fragments(RestrictedMatchDomain::Fragments(&[0, 1]), &[0, 1, 2, 3, 4])]
+#[case::residual_fragment(RestrictedMatchDomain::Fragments(&[2]), &[5, 6, 7])]
+#[case::empty_fragments(RestrictedMatchDomain::Fragments(&[]), &[])]
+#[case::one_filtered_hit(RestrictedMatchDomain::Filter("id = 1"), &[1])]
+#[case::no_filtered_hits(RestrictedMatchDomain::Filter("id < 0"), &[])]
+#[case::residual_filtered_hits(RestrictedMatchDomain::Filter("id >= 3"), &[3, 4, 5, 6, 7])]
+#[tokio::test]
+async fn test_fts_9058_candidate_domains(
+    #[case] domain: RestrictedMatchDomain,
+    #[case] candidate_ids: &[i32],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
+    let mut dataset = restricted_match_dataset(&fragments, 1, stable_row_ids).await;
+    let observations = restricted_match_maintenance_observations(
+        &mut dataset,
+        domain,
+        "alpha beta",
+        &[Some(1), None],
+    )
+    .await;
+    assert_restricted_match_oracle(
+        &format!("9058-domain-{domain:?}.json"),
+        &RESTRICTED_MATCH_CORPUS,
+        domain,
+        candidate_ids,
+        &observations,
+    );
+}
+
+#[rstest]
+#[case::allow("id = 6", &[6])]
+#[case::block("id != 1", &[0, 2, 3, 4, 5, 6, 7])]
+#[tokio::test]
+async fn test_fts_9058_scalar_index_candidates(
+    #[case] filter: &'static str,
+    #[case] candidate_ids: &[i32],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
+    let mut dataset = restricted_match_dataset(&fragments, 1, stable_row_ids).await;
+    // Build the candidate index after every append so it covers the two
+    // residual fragments as well as the fragment with the text index.
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = MatchQuery::new("alpha beta".to_owned()).with_column(Some("text".to_owned()));
+    let mut scanner = dataset.scan();
+    scanner
+        .full_text_search(FullTextSearchQuery::new_query(query.into()))
+        .unwrap()
+        .prefilter(true)
+        .filter(filter)
+        .unwrap();
+    let plan = tokio::time::timeout(Duration::from_secs(10), scanner.create_plan())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut pending = vec![plan];
+    let mut candidate_indices = Vec::new();
+    while let Some(node) = pending.pop() {
+        if node.name() == "FlatMatchQueryExec" {
+            let children = node.children();
+            assert_eq!(children.len(), 2);
+            assert_eq!(children[1].name(), "ScalarIndexExec");
+            candidate_indices.push(children[1].clone());
+        }
+        pending.extend(node.children().into_iter().cloned());
+    }
+    assert_eq!(candidate_indices.len(), 1);
+    let batches = tokio::time::timeout(
+        Duration::from_secs(10),
+        datafusion::physical_plan::collect(
+            candidate_indices.pop().unwrap(),
+            get_session_context(&LanceExecutionOptions::default()).task_ctx(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(batches.len(), 1);
+    let (selection, covered_fragments) = IndexExprResult::deserialize(&batches[0]).unwrap();
+    assert!(selection.is_exact());
+    // Scalar prefilters are scoped to the flat branch's two residual fragments.
+    assert_eq!(covered_fragments.iter().collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(selection.upper.block_list().is_some(), filter == "id != 1");
+
+    let domain = RestrictedMatchDomain::Filter(filter);
+    let observations = restricted_match_maintenance_observations(
+        &mut dataset,
+        domain,
+        "alpha beta",
+        &[Some(1), None],
+    )
+    .await;
+    for observation in &observations {
+        let plan = observation.plan.as_ref().unwrap();
+        if observation.stage == "before_optimize" {
+            assert_contains!(plan, "MatchCorpus");
+        }
+        assert_contains!(plan, "ScalarIndexQuery:");
+        assert_contains!(plan, "@id_idx(BTree)");
+    }
+    assert_restricted_match_oracle(
+        filter,
+        &RESTRICTED_MATCH_CORPUS,
+        domain,
+        candidate_ids,
+        &observations,
+    );
+}
+
+#[rstest]
+#[case::forward("forward", &[&[0_usize, 1, 2] as &[usize], &[3, 4], &[5, 6, 7]])]
+#[case::reversed("reversed", &[&[0_usize, 1, 2] as &[usize], &[5, 6, 7], &[3, 4]])]
+#[case::three_residuals("three-residuals", &[&[0_usize, 1, 2] as &[usize], &[3], &[4, 5], &[6, 7]])]
+#[tokio::test]
+async fn test_fts_9058_residual_layout(#[case] name: &str, #[case] layout: &[&[usize]]) {
+    let fragments = restricted_match_fragments(layout);
+    let mut dataset = restricted_match_dataset(&fragments, 1, false).await;
+    let domain = RestrictedMatchDomain::Prefilter;
+    let observations = restricted_match_maintenance_observations(
+        &mut dataset,
+        domain,
+        "alpha beta",
+        &[Some(1), None],
+    )
+    .await;
+    assert_restricted_match_oracle(
+        &format!("9058-layout-{name}.json"),
+        &RESTRICTED_MATCH_CORPUS,
+        domain,
+        &[0, 1],
+        &observations,
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fts_9058_no_index_matches_complete_index(
+    #[values(
+        RestrictedMatchDomain::Prefilter,
+        RestrictedMatchDomain::IndexedFragment
+    )]
+    domain: RestrictedMatchDomain,
+) {
+    let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
+    let mut dataset = restricted_match_dataset(&fragments, 0, false).await;
+    let mut observations = Vec::with_capacity(4);
+    for stage in ["without_index", "complete_index"] {
+        if stage == "complete_index" {
+            create_restricted_match_index(&mut dataset).await;
+        }
+        for limit in [Some(1), None] {
+            observations.push(
+                restricted_match_observation(&dataset, domain, stage, limit, "alpha beta").await,
+            );
+        }
+    }
+    let candidate_ids: &[i32] = match domain {
+        RestrictedMatchDomain::Prefilter => &[0, 1],
+        RestrictedMatchDomain::IndexedFragment => &[0, 1, 2],
+        _ => unreachable!("coverage comparison uses the two reported restrictions"),
+    };
+    assert_restricted_match_oracle(
+        &format!("9058-no-index-{domain:?}.json"),
+        &RESTRICTED_MATCH_CORPUS,
+        domain,
+        candidate_ids,
+        &observations,
+    );
+}
+
+#[rstest]
+#[case::zero_limit("zero-limit", "alpha beta", Some(0))]
+#[case::no_matches("no-matches", "absent", Some(1))]
+#[case::empty_query("empty-query", "", Some(1))]
+#[tokio::test]
+async fn test_fts_9058_empty_results_complete(
+    #[case] name: &str,
+    #[case] terms: &str,
+    #[case] limit: Option<i64>,
+    #[values(
+        RestrictedMatchDomain::Prefilter,
+        RestrictedMatchDomain::IndexedFragment
+    )]
+    domain: RestrictedMatchDomain,
+) {
+    let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
+    let mut dataset = restricted_match_dataset(&fragments, 1, false).await;
+    let observations =
+        restricted_match_maintenance_observations(&mut dataset, domain, terms, &[limit]).await;
+    assert_restricted_match_membership(
+        &format!("9058-empty-{name}-{domain:?}.json"),
+        &[],
+        &observations,
+    );
+}
+
+#[rstest]
+#[case::all_null("all-null", &[None, None], &[None, None], &[])]
+#[case::all_empty("all-empty", &[Some(""), Some("")], &[Some(""), Some("")], &[])]
+#[case::empty_index("empty-index", &[None, Some("")], &[Some("alpha"), None], &[2])]
+#[case::empty_residual("empty-residual", &[Some("alpha"), None], &[None, Some("")], &[0])]
+#[tokio::test]
+async fn test_fts_9058_empty_text_corpus(
+    #[case] name: &str,
+    #[case] initial: &[Option<&str>],
+    #[case] residual: &[Option<&str>],
+    #[case] expected_ids: &[i32],
+) {
+    let fragments = vec![
+        initial
+            .iter()
+            .enumerate()
+            .map(|(id, text)| (id as i32, *text))
+            .collect(),
+        residual
+            .iter()
+            .enumerate()
+            .map(|(id, text)| ((initial.len() + id) as i32, *text))
+            .collect(),
+    ];
+    let mut dataset = restricted_match_dataset(&fragments, 1, false).await;
+    let observations = restricted_match_maintenance_observations(
+        &mut dataset,
+        RestrictedMatchDomain::Filter("id >= 0"),
+        "alpha beta",
+        &[None],
+    )
+    .await;
+    // These controls check empty/null handling without imposing a different
+    // null-document counting convention on existing index formats.
+    assert_restricted_match_membership(
+        &format!("9058-text-{name}.json"),
+        expected_ids,
+        &observations,
+    );
+}
+
+#[rstest]
+#[case::indexed_row("indexed-row", "id = 1", &[0, 2, 3, 4, 6, 7])]
+#[case::residual_row("residual-row", "id = 6", &[0, 1, 2, 3, 4, 7])]
+#[case::all_rows("all-rows", "true", &[])]
+#[tokio::test]
+async fn test_fts_9058_deleted_candidates_stay_excluded(
+    #[case] name: &str,
+    #[case] deletion: &str,
+    #[case] expected_ids: &[i32],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
+    let mut dataset = restricted_match_dataset(&fragments, 1, stable_row_ids).await;
+    dataset.delete(deletion).await.unwrap();
+    let observations = restricted_match_maintenance_observations(
+        &mut dataset,
+        RestrictedMatchDomain::Filter("id >= 0"),
+        "alpha beta",
+        &[None],
+    )
+    .await;
+    // Deletions retain their established corpus-statistics semantics. The new
+    // restriction path must preserve live candidates and never revive postings.
+    assert_restricted_match_membership(
+        &format!("9058-deleted-{name}-stable-{stable_row_ids}.json"),
+        expected_ids,
+        &observations,
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fts_9058_modest_indexed_corpus_with_tail(
+    #[values(
+        RestrictedMatchDomain::Prefilter,
+        RestrictedMatchDomain::IndexedFragment
+    )]
+    domain: RestrictedMatchDomain,
+) {
+    let raw_rows: Vec<_> = (0..1100)
+        .map(|id| {
+            let text = match id {
+                0 | 1000.. => "alpha",
+                1 => "beta",
+                2 => "beta gamma delta",
+                _ => "gamma delta",
+            };
+            (id, text)
+        })
+        .collect();
+    let fragments = [&raw_rows[..1000], &raw_rows[1000..]]
+        .map(|rows| rows.iter().map(|(id, text)| (*id, Some(*text))).collect());
+    let mut dataset = restricted_match_dataset(&fragments, 1, false).await;
+    let observations = restricted_match_maintenance_observations(
+        &mut dataset,
+        domain,
+        "alpha beta",
+        &[Some(1), None],
+    )
+    .await;
+    let candidate_ids: Vec<_> = match domain {
+        RestrictedMatchDomain::Prefilter => vec![0, 1],
+        RestrictedMatchDomain::IndexedFragment => (0..1000).collect(),
+        _ => unreachable!("modest corpus uses the two reported restrictions"),
+    };
+    assert_restricted_match_oracle(
+        &format!("9058-modest-{domain:?}.json"),
+        &raw_rows,
+        domain,
+        &candidate_ids,
+        &observations,
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fts_9058_reuses_optimized_physical_plan(
+    #[values(false, true)] stable_row_ids: bool,
+    #[values(false, true)] select_fragment: bool,
+    #[values(false, true)] combined: bool,
+) {
+    let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
+    let dataset = restricted_match_dataset(&fragments, 1, stable_row_ids).await;
+    let query = if combined {
+        FtsQuery::CombinedFields(
+            CombinedFieldsQuery::try_new("alpha beta".to_owned(), vec!["text".to_owned()]).unwrap(),
+        )
+    } else {
+        MatchQuery::new("alpha beta".to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_fuzziness(Some(0))
+            .with_document_granularity(DocumentGranularity::Row)
+            .into()
+    };
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap();
+    if select_fragment {
+        scanner.with_fragments(vec![dataset.get_fragments()[0].clone().into()]);
+    } else {
+        scanner.prefilter(true).filter("id < 2").unwrap();
+    }
+    // Reusing the Scanner alone would create a fresh plan and miss scorer state
+    // retained by the physical executors. Reuse the same plan and context here.
+    let plan = tokio::time::timeout(Duration::from_secs(10), scanner.create_plan())
+        .await
+        .expect("restricted Match planning timed out")
+        .unwrap();
+    let explanation = DisplayableExecutionPlan::new(plan.as_ref())
+        .indent(false)
+        .to_string();
+    if combined {
+        assert!(
+            explanation.contains("CombinedFieldsCorpus"),
+            "{explanation}"
+        );
+        assert!(explanation.contains("FlatCombinedFields:"), "{explanation}");
+    } else {
+        assert!(explanation.contains("MatchCorpus"), "{explanation}");
+        assert!(
+            explanation
+                .lines()
+                .any(|line| line.trim_start().starts_with("MatchQuery:")),
+            "{explanation}"
+        );
+        assert!(explanation.contains("FlatMatchQuery:"), "{explanation}");
+    }
+    let context = get_session_context(&LanceExecutionOptions::default()).task_ctx();
+    let (_, mut expected) = raw_match_oracle(&RESTRICTED_MATCH_CORPUS, "alpha beta");
+    expected.retain(|(id, _)| *id < if select_fragment { 3 } else { 2 });
+    let expected = expected[0];
+    let assert_top_result = |batches: Vec<RecordBatch>| {
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        for batch in batches {
+            let ids = batch["id"].as_primitive::<Int32Type>();
+            let scores = batch[SCORE_COL].as_primitive::<Float32Type>();
+            for (id, score) in ids.values().iter().zip(scores.values()) {
+                assert_eq!(*id, expected.0);
+                assert!((f64::from(*score) - expected.1).abs() < 1e-5);
+            }
+        }
+    };
+    for _ in 0..2 {
+        let batches = tokio::time::timeout(
+            Duration::from_secs(10),
+            datafusion::physical_plan::collect(plan.clone(), context.clone()),
+        )
+        .await
+        .expect("reused restricted Match physical plan timed out")
+        .unwrap();
+        assert_top_result(batches);
+    }
+    let (left, right) = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures::future::try_join(
+            datafusion::physical_plan::collect(plan.clone(), context.clone()),
+            datafusion::physical_plan::collect(plan.clone(), context.clone()),
+        ),
+    )
+    .await
+    .expect("concurrent restricted Match physical plan executions timed out")
+    .unwrap();
+    assert_top_result(left);
+    assert_top_result(right);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RestrictedMatchControl {
+    Unfiltered,
+    Postfilter,
+    Fuzzy,
+    Boolean,
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fts_9058_match_planner_domains(
+    #[values(
+        RestrictedMatchControl::Unfiltered,
+        RestrictedMatchControl::Postfilter,
+        RestrictedMatchControl::Fuzzy,
+        RestrictedMatchControl::Boolean
+    )]
+    control: RestrictedMatchControl,
+) {
+    let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
+    let dataset = restricted_match_dataset(&fragments, 1, false).await;
+    let match_query = |terms: &str| {
+        MatchQuery::new(terms.to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_document_granularity(DocumentGranularity::Row)
+    };
+    let query: FtsQuery = match control {
+        RestrictedMatchControl::Fuzzy => match_query("alpha beta").with_fuzziness(Some(1)).into(),
+        RestrictedMatchControl::Boolean => BooleanQuery::new([
+            (Occur::Should, match_query("alpha").into()),
+            (Occur::Should, match_query("beta").into()),
+        ])
+        .into(),
+        _ => match_query("alpha beta").into(),
+    };
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap();
+    match control {
+        RestrictedMatchControl::Unfiltered => {}
+        RestrictedMatchControl::Postfilter => {
+            scanner.prefilter(false).filter("id < 2").unwrap();
+        }
+        RestrictedMatchControl::Fuzzy | RestrictedMatchControl::Boolean => {
+            scanner.prefilter(true).filter("id < 2").unwrap();
+        }
+    }
+    let explanation = tokio::time::timeout(Duration::from_secs(10), scanner.explain_plan(false))
+        .await
+        .unwrap()
+        .unwrap();
+    let plan = tokio::time::timeout(Duration::from_secs(10), scanner.create_plan())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut pending = vec![plan];
+    let mut flat_child_counts = Vec::new();
+    while let Some(node) = pending.pop() {
+        if node.name() == "FlatMatchQueryExec" {
+            flat_child_counts.push(node.children().len());
+        }
+        pending.extend(node.children().into_iter().cloned());
+    }
+    let batch = tokio::time::timeout(Duration::from_secs(10), scanner.try_into_batch())
+        .await
+        .unwrap()
+        .unwrap();
+    let ids = batch["id"].as_primitive::<Int32Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    let evidence = serde_json::json!({
+        "control": format!("{control:?}"),
+        "plan": explanation,
+        "flat_child_counts": flat_child_counts,
+        "ids": ids.as_ref(),
+        "scores": scores.as_ref(),
+    });
+    if matches!(
+        control,
+        RestrictedMatchControl::Unfiltered | RestrictedMatchControl::Postfilter
+    ) {
+        assert!(explanation.contains("MatchCorpus"), "{evidence:#}");
+        let (_, mut expected) = raw_match_oracle(&RESTRICTED_MATCH_CORPUS, "alpha beta");
+        expected.truncate(1);
+        if matches!(control, RestrictedMatchControl::Postfilter) {
+            expected.retain(|(id, _)| *id < 2);
+        }
+        assert_eq!(batch.num_rows(), expected.len(), "{evidence:#}");
+        for ((id, score), (expected_id, expected_score)) in ids.iter().zip(scores).zip(expected) {
+            assert_eq!(*id, expected_id, "{evidence:#}");
+            assert!(
+                (f64::from(*score) - expected_score).abs() < 1e-5,
+                "{evidence:#}"
+            );
+        }
+        return;
+    }
+    assert!(
+        !explanation.contains("MatchCorpus"),
+        "unrelated query acquired restricted corpus execution: {evidence:#}"
+    );
+    // Fuzzy and Boolean queries keep their existing candidate filtering paths.
+    assert!(
+        !flat_child_counts.is_empty(),
+        "missing flat path: {evidence:#}"
+    );
+    assert!(
+        flat_child_counts.iter().all(|count| *count == 1),
+        "unrelated query acquired corpus emission filtering: {evidence:#}"
+    );
+    assert_eq!(batch.num_rows(), 1, "wrong candidates: {evidence:#}");
+    assert!(scores.iter().all(|score| score.is_finite()), "{evidence:#}");
+    assert!(ids.iter().all(|id| *id < 2), "filter leaked: {evidence:#}");
+}
+
+/// Over the whole corpus "beta" is the more common term, so for the phrase
+/// "alpha beta" row 0 ("alpha" twice) outranks row 1 ("beta" twice). Over the
+/// first fragment alone the order flips.
+const PHRASE_CORPUS: [(i32, &str); 10] = [
+    (0, "alpha beta alpha"),
+    (1, "alpha beta beta"),
+    (2, "alpha"),
+    (3, "alpha gamma"),
+    (4, "beta"),
+    (5, "alpha beta"),
+    (6, "beta delta"),
+    (7, "beta gamma"),
+    (8, "gamma alpha beta"),
+    (9, "beta"),
+];
+
+/// `PHRASE_CORPUS` in three fragments.
+fn phrase_corpus_fragments() -> Vec<Vec<(i32, Option<&'static str>)>> {
+    [
+        &PHRASE_CORPUS[..4],
+        &PHRASE_CORPUS[4..7],
+        &PHRASE_CORPUS[7..],
+    ]
+    .iter()
+    .map(|rows| rows.iter().map(|(id, text)| (*id, Some(*text))).collect())
+    .collect()
+}
+
+/// One fragment per entry of `fragments`. The first `indexed_fragments` are indexed,
+/// one segment each, and the rest form the unindexed tail. With none indexed the
+/// dataset has no FTS index.
+async fn phrase_dataset(
+    fragments: &[Vec<(i32, Option<&str>)>],
+    indexed_fragments: usize,
+    with_position: bool,
+    stable_row_ids: bool,
+) -> Dataset {
+    let mut dataset = restricted_match_dataset(fragments, 0, stable_row_ids).await;
+    if indexed_fragments > 0 {
+        let fragment_groups = dataset.get_fragments()[..indexed_fragments]
+            .iter()
+            .map(|fragment| vec![fragment.id() as u32])
+            .collect();
+        create_fragmented_fts_index_with_groups(
+            &mut dataset,
+            "text",
+            with_position,
+            fragment_groups,
+        )
+        .await;
+    }
+    dataset
+}
+
+fn phrase_corpus_query() -> FtsQuery {
+    PhraseQuery::new("alpha beta".to_owned())
+        .with_column(Some("text".to_owned()))
+        .into()
+}
+
+#[rstest]
+#[case::unrestricted(RestrictedMatchDomain::Unrestricted, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])]
+#[case::prefilter(RestrictedMatchDomain::Prefilter, &[0, 1])]
+#[case::indexed_fragment(RestrictedMatchDomain::IndexedFragment, &[0, 1, 2, 3])]
+#[case::residual_filter(RestrictedMatchDomain::Filter("id >= 5"), &[5, 6, 7, 8, 9])]
+#[case::residual_fragment(RestrictedMatchDomain::Fragments(&[2]), &[7, 8, 9])]
+#[case::mixed_fragments(RestrictedMatchDomain::Fragments(&[0, 2]), &[0, 1, 2, 3, 7, 8, 9])]
+#[tokio::test]
+async fn test_fts_9058_phrase_corpus(
+    #[case] domain: RestrictedMatchDomain,
+    #[case] candidate_ids: &[i32],
+    #[values(0, 1, 2)] indexed_fragments: usize,
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = phrase_dataset(
+        &phrase_corpus_fragments(),
+        indexed_fragments,
+        true,
+        stable_row_ids,
+    )
+    .await;
+    let mut observations = Vec::with_capacity(4);
+    for stage in ["partial_index", "complete_index"] {
+        if stage == "complete_index" {
+            if indexed_fragments == 0 {
+                let fragment_ids = dataset
+                    .get_fragments()
+                    .iter()
+                    .map(|fragment| fragment.id() as u32)
+                    .collect();
+                create_fragmented_fts_index_with_groups(
+                    &mut dataset,
+                    "text",
+                    true,
+                    vec![fragment_ids],
+                )
+                .await;
+            } else {
+                dataset
+                    .optimize_indices(&OptimizeOptions::append())
+                    .await
+                    .unwrap();
+            }
+        }
+        for limit in [Some(1), None] {
+            observations.push(
+                restricted_fts_observation(&dataset, domain, stage, limit, phrase_corpus_query())
+                    .await,
+            );
+        }
+    }
+    assert_restricted_oracle(
+        &format!("9058-phrase-{domain:?}-indexed-{indexed_fragments}.json"),
+        &PHRASE_CORPUS,
+        raw_phrase_oracle(&PHRASE_CORPUS, "alpha beta"),
+        domain,
+        candidate_ids,
+        &observations,
+    );
+    for observation in &observations[..2] {
+        let plan = observation.plan.as_ref().unwrap();
+        if indexed_fragments == 0 {
+            assert_contains!(plan, "FlatMatchQuery:");
+        } else {
+            assert_contains!(plan, "MatchCorpus");
+            assert_contains!(plan, "PhraseQuery:");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_fts_9058_phrase_corpus_requires_positions() {
+    let dataset = phrase_dataset(&phrase_corpus_fragments(), 1, false, false).await;
+    let observation = restricted_fts_observation(
+        &dataset,
+        RestrictedMatchDomain::Unrestricted,
+        "without_positions",
+        None,
+        phrase_corpus_query(),
+    )
+    .await;
+    let error = observation.rows.unwrap_err();
+    assert!(
+        error.contains("position is not found but required for phrase queries"),
+        "{error}"
+    );
+    // Only the indexed fragments need positions.
+    let observation = restricted_fts_observation(
+        &dataset,
+        RestrictedMatchDomain::Fragments(&[2]),
+        "without_positions",
+        None,
+        phrase_corpus_query(),
+    )
+    .await;
+    assert_restricted_match_membership("9058-phrase-without-positions", &[8], &[observation]);
+    // Like Match, a zero limit returns no rows, before positions are checked.
+    let observation = restricted_fts_observation(
+        &dataset,
+        RestrictedMatchDomain::Unrestricted,
+        "without_positions",
+        Some(0),
+        phrase_corpus_query(),
+    )
+    .await;
+    assert_restricted_match_membership(
+        "9058-phrase-without-positions-zero-limit",
+        &[],
+        &[observation],
+    );
+}
+
+#[rstest]
+#[case::all_null("all-null", &[None, None], &[None, None], &[])]
+#[case::all_empty("all-empty", &[Some(""), Some("")], &[Some(""), Some("")], &[])]
+#[case::empty_index("empty-index", &[None, Some("")], &[Some("alpha beta"), None], &[2])]
+#[case::empty_residual("empty-residual", &[Some("alpha beta"), None], &[None, Some("")], &[0])]
+#[tokio::test]
+async fn test_fts_9058_phrase_empty_text_corpus(
+    #[case] name: &str,
+    #[case] initial: &[Option<&str>],
+    #[case] residual: &[Option<&str>],
+    #[case] expected_ids: &[i32],
+) {
+    let fragments = vec![
+        initial
+            .iter()
+            .enumerate()
+            .map(|(id, text)| (id as i32, *text))
+            .collect(),
+        residual
+            .iter()
+            .enumerate()
+            .map(|(id, text)| ((initial.len() + id) as i32, *text))
+            .collect(),
+    ];
+    let mut dataset = phrase_dataset(&fragments, 1, true, false).await;
+    let mut observations = Vec::with_capacity(2);
+    for stage in ["partial_index", "complete_index"] {
+        if stage == "complete_index" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        observations.push(
+            restricted_fts_observation(
+                &dataset,
+                RestrictedMatchDomain::Filter("id >= 0"),
+                stage,
+                None,
+                phrase_corpus_query(),
+            )
+            .await,
+        );
+    }
+    // Membership only, as in `test_fts_9058_empty_text_corpus`.
+    assert_restricted_match_membership(
+        &format!("9058-phrase-text-{name}.json"),
+        expected_ids,
+        &observations,
+    );
+}
+
+#[rstest]
+#[case::zero_limit("zero-limit", "alpha beta", Some(0))]
+#[case::no_matches("no-matches", "gamma beta", Some(1))]
+#[tokio::test]
+async fn test_fts_9058_phrase_empty_results_complete(
+    #[case] name: &str,
+    #[case] phrase: &str,
+    #[case] limit: Option<i64>,
+    #[values(
+        RestrictedMatchDomain::Unrestricted,
+        RestrictedMatchDomain::Prefilter,
+        RestrictedMatchDomain::IndexedFragment
+    )]
+    domain: RestrictedMatchDomain,
+) {
+    let mut dataset = phrase_dataset(&phrase_corpus_fragments(), 1, true, false).await;
+    let query: FtsQuery = PhraseQuery::new(phrase.to_owned())
+        .with_column(Some("text".to_owned()))
+        .into();
+    let mut observations = Vec::with_capacity(2);
+    for stage in ["partial_index", "complete_index"] {
+        if stage == "complete_index" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        observations
+            .push(restricted_fts_observation(&dataset, domain, stage, limit, query.clone()).await);
+    }
+    assert_restricted_match_membership(
+        &format!("9058-phrase-empty-{name}-{domain:?}.json"),
+        &[],
+        &observations,
+    );
+}
+
+/// Slop, a removed stop word and a repeated term change how a phrase matches and
+/// counts. Scores while the tail is unindexed must equal those once it is indexed,
+/// also when the filter drops an appended row that holds the phrase terms.
+#[rstest]
+#[case::slop("alpha delta", 1)]
+#[case::stop_word("alpha the beta", 0)]
+#[case::repeated_term("beta beta", 0)]
+#[tokio::test]
+async fn test_fts_9058_phrase_corpus_matches_complete_index(
+    #[case] phrase: &str,
+    #[case] slop: u32,
+    #[values(
+        RestrictedMatchDomain::Unrestricted,
+        RestrictedMatchDomain::Prefilter,
+        RestrictedMatchDomain::Filter("id != 4")
+    )]
+    domain: RestrictedMatchDomain,
+) {
+    let fragments: Vec<Vec<_>> = [
+        &[
+            (0, "alpha beta delta"),
+            (1, "alpha the beta beta"),
+            (2, "alpha delta gamma"),
+            (3, "beta beta"),
+        ][..],
+        &[
+            (4, "alpha the beta"),
+            (5, "beta beta gamma delta"),
+            (6, "alpha gamma delta"),
+        ],
+        &[
+            (7, "delta alpha beta delta"),
+            (8, "gamma beta beta alpha"),
+            (9, "alpha delta"),
+        ],
+    ]
+    .iter()
+    .map(|rows| rows.iter().map(|(id, text)| (*id, Some(*text))).collect())
+    .collect();
+    let mut dataset = phrase_dataset(&fragments, 1, true, false).await;
+    let query: FtsQuery = PhraseQuery::new(phrase.to_owned())
+        .with_column(Some("text".to_owned()))
+        .with_slop(slop)
+        .into();
+    let mut observations = Vec::with_capacity(4);
+    for stage in ["partial_index", "complete_index"] {
+        if stage == "complete_index" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        for limit in [Some(1), None] {
+            observations.push(
+                restricted_fts_observation(&dataset, domain, stage, limit, query.clone()).await,
+            );
+        }
+    }
+    let evidence = serde_json::json!({
+        "phrase": phrase,
+        "slop": slop,
+        "domain": format!("{domain:?}"),
+        "observations": observations,
+    });
+    let rows = |observation: &RestrictedMatchObservation| {
+        let mut rows = observation
+            .rows
+            .clone()
+            .unwrap_or_else(|error| panic!("execution failed: {error}; {evidence:#}"));
+        rows.sort_by_key(|(id, _)| *id);
+        rows
+    };
+    let (partial, complete) = observations.split_at(2);
+    let expected = rows(&complete[1]);
+    assert!(!expected.is_empty(), "no row matches: {evidence:#}");
+    let top_score = expected
+        .iter()
+        .map(|(_, score)| *score)
+        .fold(f32::MIN, f32::max);
+    for observation in observations.iter().filter(|o| o.limit.is_none()) {
+        let actual = rows(observation);
+        assert_eq!(actual.len(), expected.len(), "wrong hits: {evidence:#}");
+        for ((actual_id, actual_score), (expected_id, expected_score)) in
+            actual.iter().zip(&expected)
+        {
+            assert_eq!(actual_id, expected_id, "wrong candidate: {evidence:#}");
+            assert!(
+                (actual_score - expected_score).abs() < 1e-5,
+                "score depends on index coverage: {evidence:#}"
+            );
+        }
+    }
+    // Ties may pick either row for the top-1, so compare its score.
+    for observation in observations.iter().filter(|o| o.limit == Some(1)) {
+        let actual = rows(observation);
+        assert_eq!(actual.len(), 1, "wrong top-1: {evidence:#}");
+        assert!(
+            (actual[0].1 - top_score).abs() < 1e-5,
+            "top-1 score depends on index coverage: {evidence:#}"
+        );
+    }
+    assert_contains!(partial[0].plan.as_ref().unwrap(), "MatchCorpus");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fts_9058_phrase_corpus_reuses_physical_plan(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let dataset = phrase_dataset(&phrase_corpus_fragments(), 1, true, stable_row_ids).await;
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(phrase_corpus_query()))
+        .unwrap()
+        .prefilter(true)
+        .filter("id < 2")
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap();
+    // Each execution of the same physical plan needs its own scorer.
+    let plan = tokio::time::timeout(Duration::from_secs(10), scanner.create_plan())
+        .await
+        .expect("phrase planning timed out")
+        .unwrap();
+    let context = get_session_context(&LanceExecutionOptions::default()).task_ctx();
+    let (_, mut expected) = raw_phrase_oracle(&PHRASE_CORPUS, "alpha beta");
+    expected.retain(|(id, _)| *id < 2);
+    let expected = expected[0];
+    let assert_top_result = |batches: Vec<RecordBatch>| {
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        for batch in batches {
+            let ids = batch["id"].as_primitive::<Int32Type>();
+            let scores = batch[SCORE_COL].as_primitive::<Float32Type>();
+            for (id, score) in ids.values().iter().zip(scores.values()) {
+                assert_eq!(*id, expected.0);
+                assert!((f64::from(*score) - expected.1).abs() < 1e-5);
+            }
+        }
+    };
+    for _ in 0..2 {
+        let batches = tokio::time::timeout(
+            Duration::from_secs(10),
+            datafusion::physical_plan::collect(plan.clone(), context.clone()),
+        )
+        .await
+        .expect("reused phrase physical plan timed out")
+        .unwrap();
+        assert_top_result(batches);
+    }
+    let (left, right) = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures::future::try_join(
+            datafusion::physical_plan::collect(plan.clone(), context.clone()),
+            datafusion::physical_plan::collect(plan.clone(), context.clone()),
+        ),
+    )
+    .await
+    .expect("concurrent phrase physical plan executions timed out")
+    .unwrap();
+    assert_top_result(left);
+    assert_top_result(right);
+}
+
+#[tokio::test]
+async fn test_fts_v1_remains_queryable_after_append_optimize() {
+    let params = InvertedIndexParams::default().format_version(InvertedListFormatVersion::V1);
+    let text_col = StringArray::from(vec!["alpha original", "beta original"]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new(
+            "text",
+            text_col.data_type().to_owned(),
+            false,
+        )])
+        .into(),
+        vec![Arc::new(text_col) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, "memory://test.lance", None)
+        .await
+        .unwrap();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+    assert_eq!(dataset.load_indices().await.unwrap()[0].index_version, 1);
+
+    let appended = StringArray::from(vec!["alpha appended"]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new(
+            "text",
+            appended.data_type().to_owned(),
+            false,
+        )])
+        .into(),
+        vec![Arc::new(appended) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    dataset.append(batches, None).await.unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("alpha".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 2);
+    assert!(
+        dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .all(|index| index.index_version == 1)
+    );
+}
+
+#[tokio::test]
+async fn test_fts_unindexed_data_with_stop_words() {
+    // When indexed data has avg_doc_length < 1.0 (e.g. single-word stop words
+    // that get filtered), the BM25 scorer must still produce non-zero scores
+    // for unindexed rows. Regression test for #5871.
+    let params = InvertedIndexParams::default();
+    let text_col = StringArray::from(vec!["a", "is", "the", "bug"]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+        vec![Arc::new(text_col) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, "memory://stop_words.lance", None)
+        .await
+        .unwrap();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    // Append unindexed rows with a term not in the index
+    let unindexed: Vec<String> = (0..10).map(|i| format!("hello_{i}")).collect();
+    let text_col = StringArray::from(unindexed);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+        vec![Arc::new(text_col) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    dataset.append(batches, None).await.unwrap();
+
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 10);
+}
+
+#[tokio::test]
+async fn test_fts_unindexed_data_on_empty_index() {
+    // Empty dataset with fts index
+    let params = InvertedIndexParams::default();
+    let title_col = StringArray::from(Vec::<&str>::new());
+    let content_col = StringArray::from(Vec::<&str>::new());
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            Field::new("title", title_col.data_type().to_owned(), false),
+            Field::new("content", title_col.data_type().to_owned(), false),
+        ])
+        .into(),
+        vec![
+            Arc::new(title_col) as ArrayRef,
+            Arc::new(content_col) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, "memory://test.lance", None)
+        .await
+        .unwrap();
+    dataset
+        .create_index(&["title"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    // Test fts search
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(
+            MatchQuery::new("title".to_owned()).with_column(Some("title".to_owned())),
+        )))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 0);
+
+    // write new data
+    let title_col = StringArray::from(vec!["title hello", "title lance", "title common"]);
+    let content_col =
+        StringArray::from(vec!["content world", "content database", "content common"]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            Field::new("title", title_col.data_type().to_owned(), false),
+            Field::new("content", title_col.data_type().to_owned(), false),
+        ])
+        .into(),
+        vec![
+            Arc::new(title_col) as ArrayRef,
+            Arc::new(content_col) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    dataset.append(batches, None).await.unwrap();
+
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(
+            MatchQuery::new("title".to_owned()).with_column(Some("title".to_owned())),
+        )))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 3);
+}
+
+#[tokio::test]
+async fn test_fts_without_index() {
+    // create table without index
+    let title_col = StringArray::from(vec!["title hello", "title lance", "title common"]);
+    let content_col =
+        StringArray::from(vec!["content world", "content database", "content common"]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            Field::new("title", title_col.data_type().to_owned(), false),
+            Field::new("content", title_col.data_type().to_owned(), false),
+        ])
+        .into(),
+        vec![
+            Arc::new(title_col) as ArrayRef,
+            Arc::new(content_col) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, "memory://test.lance", None)
+        .await
+        .unwrap();
+
+    // match query on title and content
+    let results = dataset
+        .scan()
+        .full_text_search(
+            FullTextSearchQuery::new("title".to_owned())
+                .with_columns(&["title".to_string(), "content".to_string()])
+                .unwrap(),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 3);
+
+    // write new data
+    let title_col = StringArray::from(vec!["new title"]);
+    let content_col = StringArray::from(vec!["new content"]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            Field::new("title", title_col.data_type().to_owned(), false),
+            Field::new("content", title_col.data_type().to_owned(), false),
+        ])
+        .into(),
+        vec![
+            Arc::new(title_col) as ArrayRef,
+            Arc::new(content_col) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    dataset.append(batches, None).await.unwrap();
+
+    // match query on title and content
+    let results = dataset
+        .scan()
+        .full_text_search(
+            FullTextSearchQuery::new("title".to_owned())
+                .with_columns(&["title".to_string(), "content".to_string()])
+                .unwrap(),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 4);
+
+    let results = dataset
+        .scan()
+        .full_text_search(
+            FullTextSearchQuery::new("new".to_owned())
+                .with_columns(&["title".to_string(), "content".to_string()])
+                .unwrap(),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+}
+
+#[tokio::test]
+async fn test_fts_without_index_uses_scalar_index_for_prefilter() {
+    // Flat FTS must use the scalar index for candidates while keeping all six
+    // rows in the scoring corpus. The id=1 candidates contain two alpha matches.
+    let text = StringArray::from(vec![
+        "alpha bravo",
+        "charlie delta",
+        "alpha echo",
+        "foxtrot",
+        "alpha golf",
+        "hotel india",
+    ]);
+    let ids = Int32Array::from(vec![1, 1, 1, 2, 2, 2]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            Field::new("text", text.data_type().to_owned(), false),
+            Field::new("id", ids.data_type().to_owned(), false),
+        ])
+        .into(),
+        vec![Arc::new(text) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(batches, &test_uri, None).await.unwrap();
+
+    // Scalar index on `id` only — no FTS index on `text`.
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let mut scan = dataset.scan();
+    scan.prefilter(true)
+        .full_text_search(
+            FullTextSearchQuery::new("alpha".to_owned())
+                .with_columns(&["text".to_string()])
+                .unwrap(),
+        )
+        .unwrap()
+        .filter("id = 1")
+        .unwrap();
+
+    let plan = scan.analyze_plan().await.unwrap();
+    // The text read supplies the global corpus. The scalar index independently
+    // supplies the candidate mask, which is applied when matches are emitted.
+    assert_contains!(&plan, "FlatMatchQuery");
+    let corpus_read = plan
+        .lines()
+        .find(|line| line.contains("LanceRead:") && line.contains("projection=[text]"))
+        .unwrap_or_else(|| panic!("missing text corpus read: {plan}"));
+    assert_contains!(corpus_read, "full_filter=--, refine_filter=--");
+    assert_contains!(corpus_read, "rows_scanned=6");
+    let candidate_index = plan
+        .lines()
+        .find(|line| line.contains("ScalarIndexQuery:"))
+        .unwrap_or_else(|| panic!("missing scalar candidate index: {plan}"));
+    assert_contains!(candidate_index, "query=[id = 1]@id_idx(BTree)");
+    assert_contains!(candidate_index, "indices_loaded=1");
+    // The legacy plan ran a `LanceScan` wrapped in a manual `LanceFilterExec`;
+    // make sure we did not regress to that shape.
+    assert_not_contains!(&plan, "LanceScan:");
+
+    let results = scan.try_into_batch().await.unwrap();
+    // Only rows with id=1 AND text matching "alpha": rows 0 ("alpha bravo")
+    // and 2 ("alpha echo"). Row 4 ("alpha golf") has id=2 and must be excluded.
+    assert_eq!(
+        results.num_rows(),
+        2,
+        "expected the two id=1 rows that match `alpha`, got plan:\n{plan}"
+    );
+    assert_eq!(results["id"].as_primitive::<Int32Type>().values(), &[1, 1]);
+    let mut matched_text = results["text"].as_string::<i32>().iter().collect_vec();
+    matched_text.sort_unstable();
+    assert_eq!(matched_text, [Some("alpha bravo"), Some("alpha echo")]);
+}
+
+#[tokio::test]
+async fn test_fts_rank() {
+    let params = InvertedIndexParams::default();
+    let text_col =
+        GenericStringArray::<i32>::from(vec!["score", "find score", "try to find score"]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            text_col.data_type().to_owned(),
+            false,
+        )])
+        .into(),
+        vec![Arc::new(text_col) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(batches, &test_uri, None).await.unwrap();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let results = dataset
+        .scan()
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new("score".to_owned()))
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 3);
+    let row_ids = results[ROW_ID].as_primitive::<UInt64Type>().values();
+    assert_eq!(row_ids, &[0, 1, 2]);
+
+    let results = dataset
+        .scan()
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new("score".to_owned()))
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 2);
+    let row_ids = results[ROW_ID].as_primitive::<UInt64Type>().values();
+    assert_eq!(row_ids, &[0, 1]);
+
+    let results = dataset
+        .scan()
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new("score".to_owned()))
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 1);
+    let row_ids = results[ROW_ID].as_primitive::<UInt64Type>().values();
+    assert_eq!(row_ids, &[0]);
+}
+
+#[tokio::test]
+async fn test_fts_unfiltered_after_filtered_returns_real_row_ids() {
+    // After a filtered FTS scan populates the per-partition cache,
+    // the next unfiltered scan must still return real row_ids, not
+    // partition-local doc_ids. Needs >1 fragment so the two differ
+    // (fragment N's row_ids start at N << 32).
+    let text_col = GenericStringArray::<i32>::from(vec![
+        "alpha first",
+        "alpha second",
+        "alpha third",
+        "alpha fourth",
+    ]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            text_col.data_type().to_owned(),
+            false,
+        )])
+        .into(),
+        vec![Arc::new(text_col) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let fts = |ds: &Dataset, filter: Option<&str>| {
+        let mut s = ds.scan();
+        s.with_row_id()
+            .full_text_search(FullTextSearchQuery::new("alpha".to_owned()))
+            .unwrap();
+        if let Some(f) = filter {
+            s.prefilter(true).filter(f).unwrap();
+        }
+        s
+    };
+    let sorted_row_ids = |b: &RecordBatch| {
+        let mut v: Vec<u64> = b[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
+        v.sort();
+        v
+    };
+
+    let fresh = sorted_row_ids(&fts(&dataset, None).try_into_batch().await.unwrap());
+    assert_eq!(fresh.len(), 4);
+
+    // Reopen so the baseline scan's cached LazyDocSet doesn't mask
+    // the regression -- the filtered scan needs to be the first
+    // thing that touches the DocSet.
+    let dataset = Dataset::open(test_uri.as_str()).await.unwrap();
+    fts(&dataset, Some("text LIKE 'alpha first%'"))
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    let after = sorted_row_ids(&fts(&dataset, None).try_into_batch().await.unwrap());
+    assert_eq!(after, fresh);
+}
+
+async fn create_fts_dataset<
+    Offset: arrow::array::OffsetSizeTrait,
+    ListOffset: arrow::array::OffsetSizeTrait,
+>(
+    is_list: bool,
+    with_position: bool,
+    params: InvertedIndexParams,
+) -> Dataset {
+    let tempdir = TempStrDir::default();
+    let uri = tempdir.to_owned();
+    drop(tempdir);
+
+    let params = params.with_position(with_position);
+    let doc_col: Arc<dyn Array> = if is_list {
+        let string_builder = GenericStringBuilder::<Offset>::new();
+        let mut list_col = GenericListBuilder::<ListOffset, _>::new(string_builder);
+        // Create a list of strings
+        list_col.values().append_value("lance database the search"); // for testing phrase query
+        list_col.append(true);
+        list_col.values().append_value("lance database"); // for testing phrase query
+        list_col.append(true);
+        list_col.values().append_value("lance search");
+        list_col.append(true);
+        list_col.values().append_value("database");
+        list_col.values().append_value("search");
+        list_col.append(true);
+        list_col.values().append_value("unrelated doc");
+        list_col.append(true);
+        list_col.values().append_value("unrelated");
+        list_col.append(true);
+        list_col.values().append_value("mots");
+        list_col.values().append_value("accentués");
+        list_col.append(true);
+        list_col
+            .values()
+            .append_value("lance database full text search");
+        list_col.append(true);
+
+        // for testing null
+        list_col.append(false);
+
+        Arc::new(list_col.finish())
+    } else {
+        Arc::new(GenericStringArray::<Offset>::from(vec![
+            "lance database the search",
+            "lance database",
+            "lance search",
+            "database search",
+            "unrelated doc",
+            "unrelated",
+            "mots accentués",
+            "lance database full text search",
+        ]))
+    };
+    let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+
+    dataset
+        .create_index(&["doc"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    dataset
+}
+
+async fn test_fts_index<
+    Offset: arrow::array::OffsetSizeTrait,
+    ListOffset: arrow::array::OffsetSizeTrait,
+>(
+    is_list: bool,
+) {
+    let ds =
+        create_fts_dataset::<Offset, ListOffset>(is_list, false, InvertedIndexParams::default())
+            .await;
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("lance".to_owned()).limit(Some(3)))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 3, "{:?}", result);
+    let ids = result["id"].as_primitive::<UInt64Type>().values();
+    assert!(ids.contains(&0), "{:?}", result);
+    assert!(ids.contains(&1), "{:?}", result);
+    assert!(ids.contains(&2), "{:?}", result);
+
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("database".to_owned()).limit(Some(3)))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 3);
+    let ids = result["id"].as_primitive::<UInt64Type>().values();
+    assert!(ids.contains(&0), "{:?}", result);
+    assert!(ids.contains(&1), "{:?}", result);
+    assert!(ids.contains(&3), "{:?}", result);
+
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new_query(
+                MatchQuery::new("lance database".to_owned())
+                    .with_operator(Operator::And)
+                    .into(),
+            )
+            .limit(Some(5)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 3, "{:?}", result);
+    let ids = result["id"].as_primitive::<UInt64Type>().values();
+    assert!(ids.contains(&0), "{:?}", result);
+    assert!(ids.contains(&1), "{:?}", result);
+    assert!(ids.contains(&7), "{:?}", result);
+
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("unknown null".to_owned()).limit(Some(3)))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 0);
+
+    // test phrase query
+    // for non-phrasal query, the order of the tokens doesn't matter
+    // so there should be 4 documents that contain "database" or "lance"
+
+    // we built the index without position, so the phrase query will not work
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new_query(PhraseQuery::new("lance database".to_owned()).into())
+                .limit(Some(10)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await;
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("position is not found but required for phrase queries, try recreating the index with position"),"{}",err);
+
+    // recreate the index with position
+    let ds =
+        create_fts_dataset::<Offset, ListOffset>(is_list, true, InvertedIndexParams::default())
+            .await;
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("lance database".to_owned()).limit(Some(10)))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 5, "{:?}", result);
+    let ids = result["id"].as_primitive::<UInt64Type>().values();
+    assert!(ids.contains(&0));
+    assert!(ids.contains(&1));
+    assert!(ids.contains(&2));
+    assert!(ids.contains(&3));
+    assert!(ids.contains(&7));
+
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new_query(PhraseQuery::new("lance database".to_owned()).into())
+                .limit(Some(10)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = result["id"].as_primitive::<UInt64Type>().values();
+    assert_eq!(result.num_rows(), 3, "{:?}", ids);
+    assert!(ids.contains(&0));
+    assert!(ids.contains(&1));
+    assert!(ids.contains(&7));
+
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new_query(PhraseQuery::new("database lance".to_owned()).into())
+                .limit(Some(10)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 0);
+
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new_query(PhraseQuery::new("lance unknown".to_owned()).into())
+                .limit(Some(10)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 0);
+
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new_query(PhraseQuery::new("unknown null".to_owned()).into())
+                .limit(Some(3)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 0);
+
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new_query(PhraseQuery::new("lance search".to_owned()).into())
+                .limit(Some(3)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 1);
+
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new_query(
+                PhraseQuery::new("lance search".to_owned())
+                    .with_slop(2)
+                    .into(),
+            )
+            .limit(Some(3)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 2);
+
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new_query(
+                PhraseQuery::new("search lance".to_owned())
+                    .with_slop(2)
+                    .into(),
+            )
+            .limit(Some(3)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 0);
+
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            // must contain "lance" and "database", and may contain "search"
+            FullTextSearchQuery::new_query(
+                BooleanQuery::new([
+                    (
+                        Occur::Should,
+                        MatchQuery::new("search".to_owned())
+                            .with_operator(Operator::And)
+                            .into(),
+                    ),
+                    (
+                        Occur::Must,
+                        MatchQuery::new("lance database".to_owned())
+                            .with_operator(Operator::And)
+                            .into(),
+                    ),
+                ])
+                .into(),
+            )
+            .limit(Some(3)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 3, "{:?}", result);
+    let ids = result["id"].as_primitive::<UInt64Type>().values();
+    assert!(ids.contains(&0), "{:?}", result);
+    assert!(ids.contains(&1), "{:?}", result);
+    assert!(ids.contains(&7), "{:?}", result);
+
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            // must contain "lance" and "database", and may contain "search"
+            FullTextSearchQuery::new_query(
+                BooleanQuery::new([
+                    (
+                        Occur::Should,
+                        MatchQuery::new("search".to_owned())
+                            .with_operator(Operator::And)
+                            .into(),
+                    ),
+                    (
+                        Occur::Must,
+                        MatchQuery::new("lance database".to_owned())
+                            .with_operator(Operator::And)
+                            .into(),
+                    ),
+                    (
+                        Occur::MustNot,
+                        MatchQuery::new("full text".to_owned()).into(),
+                    ),
+                ])
+                .into(),
+            )
+            .limit(Some(3)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 2, "{:?}", result);
+    let ids = result["id"].as_primitive::<UInt64Type>().values();
+    assert!(ids.contains(&0), "{:?}", result);
+    assert!(ids.contains(&1), "{:?}", result);
+}
+
+#[tokio::test]
+async fn test_fts_index_with_string() {
+    test_fts_index::<i32, i32>(false).await;
+    test_fts_index::<i32, i32>(true).await;
+    test_fts_index::<i32, i64>(true).await;
+}
+
+#[tokio::test]
+async fn test_fts_index_with_large_string() {
+    test_fts_index::<i64, i32>(false).await;
+    test_fts_index::<i64, i32>(true).await;
+    test_fts_index::<i64, i64>(true).await;
+}
+
+#[tokio::test]
+async fn test_fts_list_index_uses_row_level_documents() {
+    let tempdir = TempStrDir::default();
+    let uri = tempdir.to_owned();
+    drop(tempdir);
+
+    let mut list_col = GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
+    list_col.values().append_value("lance");
+    list_col.values().append_value("lance database");
+    list_col.append(true);
+    list_col.values().append_value("database");
+    list_col.append(true);
+    list_col.append(true);
+    list_col.values().append_null();
+    list_col.append(true);
+    list_col.append(false);
+
+    let docs = Arc::new(list_col.finish()) as ArrayRef;
+    let ids = Arc::new(UInt64Array::from_iter_values(0..docs.len() as u64)) as ArrayRef;
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("doc", docs.data_type().clone(), true),
+            ArrowField::new("id", DataType::UInt64, false),
+        ])),
+        vec![docs, ids],
+    )
+    .unwrap();
+    let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("lance".to_owned()).limit(Some(10)))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), &[0]);
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("database".to_owned()).limit(Some(10)))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut ids = result["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![0, 1], "{:?}", result);
+}
+
+#[tokio::test]
+async fn test_fts_list_phrase_query_can_cross_elements() {
+    assert_fts_list_phrase_query_can_cross_elements::<i32>().await;
+}
+
+#[tokio::test]
+async fn test_fts_large_list_phrase_query_can_cross_elements() {
+    assert_fts_list_phrase_query_can_cross_elements::<i64>().await;
+}
+
+async fn assert_fts_list_phrase_query_can_cross_elements<Offset: arrow::array::OffsetSizeTrait>() {
+    let tempdir = TempStrDir::default();
+    let uri = tempdir.to_owned();
+    drop(tempdir);
+
+    let mut list_col = GenericListBuilder::<Offset, _>::new(GenericStringBuilder::<Offset>::new());
+    let rows: &[&[&str]] = &[
+        &["alpha", "beta"],
+        &["want the", "apple"],
+        &["want", "apple"],
+    ];
+    for values in rows.iter().copied() {
+        for value in values {
+            list_col.values().append_value(value);
+        }
+        list_col.append(true);
+    }
+
+    let docs = Arc::new(list_col.finish()) as ArrayRef;
+    let ids = Arc::new(UInt64Array::from(vec![0u64, 1, 2])) as ArrayRef;
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("doc", docs.data_type().clone(), true),
+            ArrowField::new("id", DataType::UInt64, false),
+        ])),
+        vec![docs, ids],
+    )
+    .unwrap();
+    let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+
+    let cases: [(&str, &[u64]); 3] = [
+        ("alpha beta", &[0]),
+        ("want the apple", &[1]),
+        ("want apple", &[2]),
+    ];
+    let mut flat_results = Vec::with_capacity(cases.len());
+    for (terms, expected) in cases {
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new_query(
+                    PhraseQuery::new(terms.to_owned())
+                        .with_column(Some("doc".to_owned()))
+                        .into(),
+                )
+                .limit(Some(10)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), expected);
+        flat_results.push(result);
+    }
+
+    let params = InvertedIndexParams::default()
+        .with_position(true)
+        .remove_stop_words(true);
+    dataset
+        .create_index(&["doc"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    for ((terms, expected), flat_result) in cases.into_iter().zip(flat_results) {
+        let indexed_result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new_query(
+                    PhraseQuery::new(terms.to_owned())
+                        .with_column(Some("doc".to_owned()))
+                        .into(),
+                )
+                .limit(Some(10)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            indexed_result["id"].as_primitive::<UInt64Type>().values(),
+            expected
+        );
+        assert_eq!(
+            indexed_result["id"].as_primitive::<UInt64Type>().values(),
+            flat_result["id"].as_primitive::<UInt64Type>().values(),
+            "query={terms}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_fts_accented_chars() {
+    let ds = create_fts_dataset::<i32, i32>(false, false, InvertedIndexParams::default()).await;
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 1);
+
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 0);
+
+    // with ascii folding enabled, the search should be accent-insensitive
+    let ds = create_fts_dataset::<i32, i32>(
+        false,
+        false,
+        InvertedIndexParams::default()
+            .stem(false)
+            .ascii_folding(true),
+    )
+    .await;
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 1);
+
+    let result = ds
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 1);
+}
+
+#[tokio::test]
+async fn test_fts_phrase_query() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let words = ["lance", "full", "text", "search"];
+    let mut lance_search_count = 0;
+    let mut full_text_count = 0;
+    let mut doc_array = (0..256)
+        .map(|_| {
+            let mut rng = rand::rng();
+            let mut text = String::with_capacity(128);
+            let len = rng.random_range(31..128);
+            for i in 0..len {
+                if i > 0 {
+                    text.push(' ');
+                }
+                text.push_str(words[rng.random_range(0..words.len())]);
+            }
+            if text.contains("lance search") {
+                lance_search_count += 1;
+            }
+            if text.contains("full text") {
+                full_text_count += 1;
+            }
+            text
+        })
+        .collect_vec();
+    // Ensure at least one doc matches each phrase deterministically
+    doc_array.push("lance search".to_owned());
+    lance_search_count += 1;
+    doc_array.push("full text".to_owned());
+    full_text_count += 1;
+    doc_array.push("position for phrase query".to_owned());
+
+    // 1) Build index without positions and assert phrase query errors
+    let params_no_pos = InvertedIndexParams::default().with_position(false);
+    let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(doc_array.clone()));
+    let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(&["doc"], IndexType::Inverted, None, &params_no_pos, true)
+        .await
+        .unwrap();
+
+    let err = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("lance search".to_owned()).into(),
+        ))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("position is not found but required for phrase queries, try recreating the index with position"), "{}", err);
+    assert!(err.starts_with("Invalid user input: "), "{}", err);
+
+    // 2) Recreate index with positions and assert phrase query works
+    let params_with_pos = InvertedIndexParams::default().with_position(true);
+    dataset
+        .create_index(&["doc"], IndexType::Inverted, None, &params_with_pos, true)
+        .await
+        .unwrap();
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("lance search".to_owned()).into(),
+        ))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), lance_search_count);
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("full text".to_owned()).into(),
+        ))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), full_text_count);
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("phrase query".to_owned()).into(),
+        ))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 1);
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("".to_owned()).into(),
+        ))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 0);
+}
+
+async fn open_dataset_with_fresh_session(uri: &str) -> Dataset {
+    DatasetBuilder::from_uri(uri)
+        .with_session(Arc::new(Session::new(1 << 20, 1 << 20, Default::default())))
+        .load()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_fts_prewarm_with_position_controls_phrase_query_cache() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(vec![
+        "lance search",
+        "lance search with tail",
+        "phrase query",
+    ]));
+    let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            Some("fts_idx".to_owned()),
+            &InvertedIndexParams::default().with_position(true),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let dataset = open_dataset_with_fresh_session(&uri).await;
+    dataset.prewarm_index("fts_idx").await.unwrap();
+    let cache_entries_after_prewarm = dataset.index_cache_entry_count().await;
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("lance search".to_owned()).into(),
+        ))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 2);
+    let cache_entries_after_query = dataset.index_cache_entry_count().await;
+    assert!(
+        cache_entries_after_query > cache_entries_after_prewarm,
+        "phrase query should populate positions cache when prewarm skipped positions"
+    );
+
+    let dataset = open_dataset_with_fresh_session(&uri).await;
+    dataset
+        .prewarm_index_with_options(
+            "fts_idx",
+            &PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true)),
+        )
+        .await
+        .unwrap();
+    let cache_entries_after_prewarm = dataset.index_cache_entry_count().await;
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("lance search".to_owned()).into(),
+        ))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 2);
+    let cache_entries_after_query = dataset.index_cache_entry_count().await;
+    assert_eq!(
+        cache_entries_after_query, cache_entries_after_prewarm,
+        "phrase query should not add cache entries after prewarming positions"
+    );
+}
+
+#[tokio::test]
+async fn test_prewarm_index_with_position_validation() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(vec![
+        "lance search",
+        "phrase query",
+    ]));
+    let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            Some("fts_idx".to_owned()),
+            &InvertedIndexParams::default().with_position(false),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let dataset = open_dataset_with_fresh_session(&uri).await;
+    let err = dataset
+        .prewarm_index_with_options(
+            "fts_idx",
+            &PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true)),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_contains!(
+        err,
+        "cannot prewarm positions for an inverted index that was built without positions"
+    );
+
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let batch = RecordBatch::try_from_iter(vec![(
+        "id",
+        Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+    )])
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("id_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let dataset = open_dataset_with_fresh_session(&uri).await;
+    let err = dataset
+        .prewarm_index_with_options("id_idx", &PrewarmOptions::Fts(FtsPrewarmOptions::default()))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_contains!(
+        err,
+        "FTS prewarm options are only supported for inverted indices"
+    );
+}
+
+#[tokio::test]
+async fn test_fts_best_effort_prewarm_result_reports_dataset_partial_residency() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from_iter_values(
+        (0..4096).map(|row| format!("cache pressure token {row}")),
+    ));
+    let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            Some("fts_idx".to_owned()),
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let session = Arc::new(Session::with_index_cache_backend(
+        Arc::new(QuickCacheBackend::with_capacity(8 * 1024)),
+        8 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+    let options = PrewarmOptions::Fts(FtsPrewarmOptions::default().best_effort());
+
+    dataset
+        .prewarm_index_with_options("fts_idx", &options)
+        .await
+        .unwrap();
+    let result = dataset
+        .prewarm_index_with_options_result("fts_idx", &options)
+        .await
+        .unwrap();
+
+    assert!(
+        !result.fully_resident,
+        "tiny cache should make best-effort dataset prewarm report partial residency"
+    );
+    let diagnostics = result
+        .diagnostics
+        .expect("partial dataset prewarm should return aggregate diagnostics");
+    assert!(diagnostics.partition_count > 0);
+    assert!(!diagnostics.failing_segments.is_empty() || !diagnostics.failing_partitions.is_empty());
+    assert!(
+        diagnostics
+            .failing_partitions
+            .iter()
+            .all(|partition| partition.segment_id.is_some()),
+        "dataset aggregation should attach segment ids to partition diagnostics"
+    );
+}
+
+#[derive(Debug)]
+struct SingleScalarContainerCacheBackend {
+    inner: QuickCacheBackend,
+    scalar_container_inserts: AtomicUsize,
+}
+
+impl SingleScalarContainerCacheBackend {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: QuickCacheBackend::with_capacity(capacity),
+            scalar_container_inserts: AtomicUsize::new(0),
+        }
+    }
+
+    fn rejects_scalar_container(entry: &CacheEntry, codec: Option<&CacheCodec>) -> bool {
+        // Whole-container entries are stored as Arc<dyn ScalarIndex> by custom plugin
+        // paths and as StoreBoundScalarIndexCacheEntry by the default cache path.
+        codec.is_none()
+            && (entry.as_ref().is::<Arc<dyn ScalarIndex>>()
+                || entry.as_ref().is::<Arc<StoreBoundScalarIndexCacheEntry>>())
+    }
+}
+
+#[async_trait::async_trait]
+impl CacheBackend for SingleScalarContainerCacheBackend {
+    async fn get(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry> {
+        self.inner.get(key, codec).await
+    }
+
+    async fn insert(
+        &self,
+        key: &InternalCacheKey,
+        entry: CacheEntry,
+        size_bytes: usize,
+        codec: Option<CacheCodec>,
+    ) {
+        if Self::rejects_scalar_container(&entry, codec.as_ref())
+            && self
+                .scalar_container_inserts
+                .fetch_add(1, Ordering::Relaxed)
+                > 0
+        {
+            return;
+        }
+        self.inner.insert(key, entry, size_bytes, codec).await;
+    }
+
+    async fn get_or_insert<'a>(
+        &self,
+        key: &InternalCacheKey,
+        loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+        codec: Option<CacheCodec>,
+    ) -> Result<(CacheEntry, bool)> {
+        if codec.is_none() {
+            if let Some(entry) = self.inner.get(key, None).await {
+                return Ok((entry, true));
+            }
+            let (entry, size_bytes) = loader.await?;
+            if Self::rejects_scalar_container(&entry, None)
+                && self
+                    .scalar_container_inserts
+                    .fetch_add(1, Ordering::Relaxed)
+                    > 0
+            {
+                return Ok((entry, false));
+            }
+            self.inner
+                .insert(key, entry.clone(), size_bytes, codec)
+                .await;
+            return Ok((entry, false));
+        }
+        self.inner.get_or_insert(key, loader, codec).await
+    }
+
+    async fn clear(&self) {
+        self.inner.clear().await;
+    }
+
+    async fn num_entries(&self) -> usize {
+        self.inner.num_entries().await
+    }
+
+    async fn size_bytes(&self) -> usize {
+        self.inner.size_bytes().await
+    }
+
+    fn approx_num_entries(&self) -> usize {
+        self.inner.approx_num_entries()
+    }
+
+    fn approx_size_bytes(&self) -> usize {
+        self.inner.approx_size_bytes()
+    }
+}
+
+async fn two_segment_fts_dataset(uri: &str) -> Dataset {
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("doc", DataType::Utf8, true),
+        arrow_schema::Field::new("id", DataType::UInt64, false),
+    ]));
+    let make_batch = |fragment: u64| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(GenericStringArray::<i32>::from_iter_values(
+                    (0..32u64).map(|row| format!("segment {fragment} token {row}")),
+                )) as ArrayRef,
+                Arc::new(UInt64Array::from_iter_values(
+                    (0..32u64).map(|row| fragment * 32 + row),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    };
+
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![make_batch(0)].into_iter().map(Ok), schema.clone()),
+        uri,
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            Some("fts_idx".to_owned()),
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![make_batch(1)].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset.load_indices_by_name("fts_idx").await.unwrap().len(),
+        2
+    );
+    dataset
+}
+
+async fn open_with_single_scalar_container_cache(uri: &str) -> Dataset {
+    let session = Arc::new(Session::with_index_cache_backend(
+        Arc::new(SingleScalarContainerCacheBackend::new(128 * 1024 * 1024)),
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    DatasetBuilder::from_uri(uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_fts_best_effort_prewarm_reports_missing_scalar_container() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    two_segment_fts_dataset(&uri).await;
+    let dataset = open_with_single_scalar_container_cache(&uri).await;
+    let options = PrewarmOptions::Fts(FtsPrewarmOptions::default().best_effort());
+
+    let result = dataset
+        .prewarm_index_with_options_result("fts_idx", &options)
+        .await
+        .unwrap();
+
+    assert!(
+        !result.fully_resident,
+        "dataset prewarm must be partial when a selected segment's scalar index \
+         container is not cache-resident"
+    );
+    let diagnostics = result
+        .diagnostics
+        .expect("missing scalar container should produce aggregate diagnostics");
+    assert_eq!(
+        diagnostics.failing_segments.len(),
+        1,
+        "only the rejected scalar container should be reported as missing"
+    );
+    assert!(
+        diagnostics.failing_partitions.is_empty(),
+        "a missing scalar container should not be represented as a partition failure"
+    );
+    let failure = &diagnostics.failing_segments[0];
+    assert!(!failure.scalar_index_container_resident);
+    assert!(!failure.scalar_index_container_matches_prewarmed);
+}
+
+#[tokio::test]
+async fn test_fts_strict_prewarm_fails_missing_scalar_container() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    two_segment_fts_dataset(&uri).await;
+    let dataset = open_with_single_scalar_container_cache(&uri).await;
+    let options = PrewarmOptions::Fts(FtsPrewarmOptions::default());
+
+    let err = dataset
+        .prewarm_index_with_options_result("fts_idx", &options)
+        .await
+        .expect_err("strict prewarm should fail after final scalar-container audit");
+    assert!(
+        err.to_string().contains("resident scalar index container"),
+        "strict error should describe the missing scalar container: {err}"
+    );
+}
+
+/// Validates the OSS-741 contract: after FTS prewarm through a serializing
+/// cache backend, FTS queries serve results without any further IO. The
+/// serializing backend forces every cache hit through the new
+/// `CacheCodec` impls, so this also smoke-tests the round-trip path under
+/// realistic data shapes (compressed posting blocks + shared position
+/// stream when positions are enabled).
+#[tokio::test]
+async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
+    use lance_io::assert_io_eq;
+
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
+
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(vec![
+        "lance search engine",
+        "lance search with tail",
+        "phrase query example",
+        "search query terms",
+    ]));
+    let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            Some("fts_idx".to_owned()),
+            &InvertedIndexParams::default().with_position(true),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Re-open the dataset on a session whose cache backend serializes every
+    // entry through its codec. Set a generous capacity so nothing is evicted
+    // before we query.
+    let backend = Arc::new(SerializingCacheBackend::new());
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend.clone(),
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    // Reset IO counters to isolate prewarm + query traffic from open/load.
+    dataset.object_store.as_ref().io_stats_incremental();
+
+    dataset
+        .prewarm_index_with_options(
+            "fts_idx",
+            &PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true)),
+        )
+        .await
+        .unwrap();
+
+    // The FTS codec must have been exercised. Posting lists and positions
+    // enter the serialized store; non-FTS entries (e.g. the unsized
+    // `ScalarIndexCacheKey` for the index itself) legitimately fall through
+    // to the in-memory passthrough — those cannot have a codec by design.
+    let serialized_after_prewarm = backend.serialized_entry_count().await;
+    assert!(
+        serialized_after_prewarm > 0,
+        "prewarm should have routed FTS entries (PostingList / Positions) through CacheCodec, \
+         but the serializing store was empty"
+    );
+
+    // After prewarm, a phrase query (which exercises both posting lists and
+    // positions, deserializing them from bytes via the codec) must not hit
+    // disk.
+    dataset.object_store.as_ref().io_stats_incremental();
+
+    // Project `_rowid` so the scan does not need to read a data column from
+    // the dataset's parquet/lance files; the index path alone determines
+    // whether the FTS cache is doing its job.
+    let result = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("lance search".to_owned()).into(),
+        ))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        result.num_rows(),
+        2,
+        "phrase query should still return correct results after deserialization"
+    );
+
+    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_io_eq!(
+        stats,
+        read_iops,
+        0,
+        "FTS query should not perform IO after prewarm; the serializing cache \
+         backend must serve every posting list and positions entry from memory"
+    );
+}
+
+/// BTree analogue of `test_fts_prewarm_with_serializing_backend_serves_query_with_no_io`:
+/// after prewarming a BTree scalar index through a serializing cache backend,
+/// an indexed-filter query serves results without any further IO. The
+/// serializing backend forces every cache hit through the `BTreeIndexState`
+/// and `FlatIndex` `CacheCodec` impls, so this also smoke-tests those
+/// round-trip paths on a multi-page index.
+#[tokio::test]
+async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
+    use lance_io::assert_io_eq;
+
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
+
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    // Enough rows to span several BTree pages (default page size is 4096) so
+    // the query has to consult more than one cached `FlatIndex`.
+    let num_rows = 16_384;
+    let values = Int32Array::from_iter_values(0..num_rows);
+    let ids = UInt64Array::from_iter_values(0..num_rows as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("value", DataType::Int32, false),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(values) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            Some("value_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Re-open on a session whose cache backend serializes every entry through
+    // its codec, with a generous capacity so nothing is evicted before we query.
+    let backend = Arc::new(SerializingCacheBackend::new());
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend.clone(),
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    // Reset IO counters to isolate prewarm + query traffic from open/load.
+    dataset.object_store.as_ref().io_stats_incremental();
+
+    dataset.prewarm_index("value_idx").await.unwrap();
+
+    // Prewarm opens the index (serializing `BTreeIndexState`) and loads every
+    // page (serializing each `FlatIndex`), so the serialized store must be
+    // non-empty. The unsized fallback keys cannot have a codec by design.
+    let serialized_after_prewarm = backend.serialized_entry_count().await;
+    assert!(
+        serialized_after_prewarm > 0,
+        "prewarm should have routed the BTree state and pages through CacheCodec, \
+         but the serializing store was empty"
+    );
+
+    drop(dataset);
+    let backend = Arc::new(backend.restart());
+    assert_eq!(
+        backend.l1_entry_count().await,
+        0,
+        "restarting must discard the in-memory L1"
+    );
+    assert_eq!(
+        backend.serialized_entry_count().await,
+        serialized_after_prewarm,
+        "restarting must retain only the serialized entries"
+    );
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend,
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    // After recreating the backend, an indexed-filter query must reconstruct
+    // the index and every page it touches from serialized bytes, with no disk
+    // IO. Project only `_rowid` so the scan does not read a data column.
+    dataset.object_store.as_ref().io_stats_incremental();
+
+    let result = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .filter("value >= 100 AND value < 200")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        result.num_rows(),
+        100,
+        "indexed filter should still return correct results after deserialization"
+    );
+
+    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_io_eq!(
+        stats,
+        read_iops,
+        0,
+        "BTree filter query should not perform IO after prewarm; the serializing \
+         cache backend must serve the index state and every page from memory"
+    );
+}
+
+/// Bitmap analogue of `test_btree_prewarm_with_serializing_backend_serves_query_with_no_io`:
+/// after prewarming a Bitmap scalar index through a serializing cache backend,
+/// an indexed-filter query serves results without any further IO. The
+/// serializing backend forces every cache hit through the `BitmapIndexState`
+/// (top-level state) and `RowAddrTreeMap` (per-value bitmap) `CacheCodec`
+/// impls, so this exercises both round-trip paths.
+#[tokio::test]
+async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() {
+    use lance_io::assert_io_eq;
+
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
+
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    // Low-cardinality column so the index has several per-value bitmaps to
+    // round-trip through the per-key codec.
+    let num_rows: i32 = 8_000;
+    let values = Int32Array::from_iter_values((0..num_rows).map(|i| i % 16));
+    let ids = UInt64Array::from_iter_values(0..num_rows as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("value", DataType::Int32, false),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(values) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::Bitmap,
+            Some("value_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let backend = Arc::new(SerializingCacheBackend::new());
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend.clone(),
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    dataset.object_store.as_ref().io_stats_incremental();
+    dataset.prewarm_index("value_idx").await.unwrap();
+
+    let serialized_after_prewarm = backend.serialized_entry_count().await;
+    assert!(
+        serialized_after_prewarm > 0,
+        "prewarm should have routed the bitmap state and per-value bitmaps through \
+         CacheCodec, but the serializing store was empty"
+    );
+
+    dataset.object_store.as_ref().io_stats_incremental();
+    let result = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .filter("value = 7")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let expected = (num_rows as usize) / 16;
+    assert_eq!(
+        result.num_rows(),
+        expected,
+        "indexed bitmap filter should return correct results after deserialization"
+    );
+
+    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_io_eq!(
+        stats,
+        read_iops,
+        0,
+        "Bitmap filter query should not perform IO after prewarm; the serializing \
+         cache backend must serve the index state and every per-value bitmap from memory"
+    );
+}
+
+#[rstest]
+#[case::list(false)]
+#[case::large_list(true)]
+#[tokio::test]
+async fn test_label_list_index_types(#[case] large_list: bool) {
+    let test_uri = TempStrDir::default();
+    let label_values = vec![
+        Some(vec![Some(1), Some(2)]),
+        Some(vec![Some(2)]),
+        Some(vec![Some(1)]),
+        Some(vec![Some(3)]),
+    ];
+    let labels: ArrayRef = if large_list {
+        Arc::new(LargeListArray::from_iter_primitive::<Int64Type, _, _>(
+            label_values,
+        ))
+    } else {
+        Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+            label_values,
+        ))
+    };
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("labels", labels.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![0, 1, 2, 3])), labels],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+
+    let expected = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .filter("array_has_any(labels, [1])")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let expected_ids = expected
+        .column(0)
+        .as_primitive::<Int32Type>()
+        .values()
+        .to_vec();
+    assert_eq!(expected_ids, vec![0, 2]);
+
+    dataset
+        .create_index(
+            &["labels"],
+            IndexType::LabelList,
+            Some("labels_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .filter("array_has_any(labels, [1])")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let result_ids = result
+        .column(0)
+        .as_primitive::<Int32Type>()
+        .values()
+        .to_vec();
+    assert_eq!(result_ids, expected_ids);
+
+    let plan = dataset
+        .scan()
+        .filter("array_has_any(labels, [1])")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery") && plan.contains("LabelList"),
+        "Expected LabelList scalar index query in plan: {plan}"
+    );
+}
+
+/// DataFusion types the literal list as Int64 and casts a narrower integer column to
+/// match, which must not stop the LabelList index from answering. Literals outside the
+/// item range must keep falling back to a scan instead of matching NULL items.
+#[tokio::test]
+async fn test_label_list_index_on_int32_items() {
+    let test_uri = TempStrDir::default();
+    let labels = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+        Some(vec![Some(1), Some(2)]),
+        Some(vec![Some(3)]),
+        Some(vec![Some(2), Some(3)]),
+        None,
+        Some(vec![None, Some(1)]),
+    ]);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("labels", labels.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])),
+            Arc::new(labels),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["labels"],
+            IndexType::LabelList,
+            Some("labels_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for (filter, expected_ids, uses_index) in [
+        ("array_has(labels, 2)", vec![0, 2], true),
+        ("array_has_any(labels, [1, 3])", vec![0, 1, 2, 4], true),
+        ("array_has_all(labels, [2, 3])", vec![2], true),
+        ("array_has(labels, 3000000000)", vec![], false),
+        ("array_has_any(labels, [3, 3000000000])", vec![1, 2], false),
+        ("array_has_all(labels, [1, 3000000000])", vec![], false),
+    ] {
+        let mut scanner = dataset.scan();
+        scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut ids = batch
+            .column(0)
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, expected_ids, "{filter}");
+
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert_eq!(
+            plan.contains("ScalarIndexQuery") && plan.contains("LabelList"),
+            uses_index,
+            "{filter}: {plan}"
+        );
+    }
+}
+
+/// LabelList analogue: after prewarming, an `array_has_any` query against a
+/// `LabelList` index serves results without any further IO. Exercises the
+/// `LabelListIndexState` codec (which embeds the inner bitmap state and the
+/// list-nulls bitmap) plus the same per-value bitmap codec.
+#[tokio::test]
+async fn test_label_list_prewarm_with_serializing_backend_serves_query_with_no_io() {
+    use lance_io::assert_io_eq;
+
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
+
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    let mut dataset = gen_batch()
+        .col(
+            "labels",
+            lance_datagen::array::rand_list_any(
+                lance_datagen::array::cycle::<arrow::datatypes::Int64Type>(vec![1, 2, 3, 4, 5]),
+                false,
+            ),
+        )
+        .into_dataset(&uri, FragmentCount::from(2), FragmentRowCount::from(2000))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["labels"],
+            IndexType::LabelList,
+            Some("labels_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let expected = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .filter("array_has_any(labels, [3])")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap()
+        .num_rows();
+    assert!(
+        expected > 0,
+        "test dataset must contain at least one row whose labels include 3"
+    );
+
+    let backend = Arc::new(SerializingCacheBackend::new());
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend.clone(),
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    dataset.object_store.as_ref().io_stats_incremental();
+    dataset.prewarm_index("labels_idx").await.unwrap();
+
+    let serialized_after_prewarm = backend.serialized_entry_count().await;
+    assert!(
+        serialized_after_prewarm > 0,
+        "prewarm should have routed the label-list state and per-value bitmaps through \
+         CacheCodec, but the serializing store was empty"
+    );
+
+    dataset.object_store.as_ref().io_stats_incremental();
+    let result = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .filter("array_has_any(labels, [3])")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        result.num_rows(),
+        expected,
+        "indexed label-list filter should return correct results after deserialization"
+    );
+
+    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_io_eq!(
+        stats,
+        read_iops,
+        0,
+        "LabelList filter query should not perform IO after prewarm; the serializing \
+         cache backend must serve the index state and every per-value bitmap from memory"
+    );
+}
+
+#[tokio::test]
+async fn test_fts_phrase_query_with_removed_stop_words() {
+    let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(vec![
+        "want the apple",
+        "want an apple",
+        "want green apple",
+        "apple want the",
+    ]));
+    let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, "memory://", None).await.unwrap();
+
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .with_position(true)
+                .remove_stop_words(true),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for query in ["want the apple", "want an apple"] {
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(
+                PhraseQuery::new(query.to_owned()).into(),
+            ))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let ids = result["id"].as_primitive::<UInt64Type>().values();
+        assert_eq!(result.num_rows(), 3, "query={query}, ids={ids:?}");
+        assert!(ids.contains(&0), "query={query}, ids={ids:?}");
+        assert!(ids.contains(&1), "query={query}, ids={ids:?}");
+        assert!(ids.contains(&2), "query={query}, ids={ids:?}");
+    }
+}
+
+#[tokio::test]
+async fn test_fts_without_index_on_zero_fragment_dataset_is_empty() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::UInt64, false),
+        ArrowField::new("doc", DataType::Utf8, true),
+    ]));
+    let empty_reader = RecordBatchIterator::new(vec![], schema);
+    let dataset = Dataset::write(empty_reader, "memory://", None)
+        .await
+        .unwrap();
+    assert!(dataset.fragments().is_empty());
+
+    let mut scan = dataset.scan();
+    scan.project(&["id"]).unwrap();
+    scan.full_text_search(FullTextSearchQuery::new_query(
+        MatchQuery::new("alpha".to_owned())
+            .with_column(Some("doc".to_owned()))
+            .into(),
+    ))
+    .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(plan.contains("EmptyExec"), "unexpected plan: {plan}");
+    assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 0);
+
+    let mut phrase_scan = dataset.scan();
+    phrase_scan.project(&["id"]).unwrap();
+    phrase_scan
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("alpha beta".to_owned())
+                .with_column(Some("doc".to_owned()))
+                .into(),
+        ))
+        .unwrap();
+    let phrase_plan = phrase_scan.explain_plan(false).await.unwrap();
+    assert!(
+        phrase_plan.contains("EmptyExec"),
+        "unexpected phrase plan: {phrase_plan}"
+    );
+    assert_eq!(phrase_scan.try_into_batch().await.unwrap().num_rows(), 0);
+}
+
+#[tokio::test]
+async fn test_fts_phrase_query_normalizes_leading_stop_word_position() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let initial = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(UInt64Array::from(vec![99])) as ArrayRef),
+        (
+            "doc",
+            Arc::new(StringArray::from(vec!["placeholder"])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let initial_reader = RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema());
+    let mut dataset = Dataset::write(initial_reader, &uri, None).await.unwrap();
+    let index_params = InvertedIndexParams::default()
+        .with_position(true)
+        .remove_stop_words(true);
+    dataset
+        .create_index(&["doc"], IndexType::Inverted, None, &index_params, true)
+        .await
+        .unwrap();
+
+    let appended = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(UInt64Array::from(vec![0, 1, 2])) as ArrayRef),
+        (
+            "doc",
+            Arc::new(StringArray::from(vec![
+                "alpha beta",
+                "the alpha beta",
+                "alpha gap beta",
+            ])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let appended_reader = RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema());
+    dataset = Dataset::write(
+        appended_reader,
+        Arc::new(dataset),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let appended_fragment = dataset.fragments().last().unwrap().clone();
+    let query = FullTextSearchQuery::new_query(
+        PhraseQuery::new("the alpha beta".to_owned())
+            .with_column(Some("doc".to_owned()))
+            .into(),
+    );
+
+    let mut flat_scan = dataset.scan();
+    flat_scan.with_fragments(vec![appended_fragment.clone()]);
+    flat_scan.project(&["id"]).unwrap();
+    flat_scan.full_text_search(query.clone()).unwrap();
+    let flat_result = flat_scan.try_into_batch().await.unwrap();
+    let mut flat_ids = flat_result["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+    flat_ids.sort_unstable();
+    assert_eq!(flat_ids, vec![0, 1]);
+
+    dataset
+        .create_index(&["doc"], IndexType::Inverted, None, &index_params, true)
+        .await
+        .unwrap();
+    let mut indexed_scan = dataset.scan();
+    indexed_scan.with_fragments(vec![appended_fragment]);
+    indexed_scan.project(&["id"]).unwrap();
+    indexed_scan.full_text_search(query).unwrap();
+    let indexed_result = indexed_scan.try_into_batch().await.unwrap();
+    let mut indexed_ids = indexed_result["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+    indexed_ids.sort_unstable();
+    assert_eq!(indexed_ids, flat_ids);
+}
+
+#[tokio::test]
+async fn test_fts_phrase_query_preserves_stop_word_gaps() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(vec![
+        "the united states of america",
+        "the united states and america",
+        "united states america",
+        "the united states of north america",
+    ]));
+    let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .with_position(true)
+                .remove_stop_words(true),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("the united states of america".to_owned()).into(),
+        ))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    let ids = result["id"].as_primitive::<UInt64Type>().values();
+    assert_eq!(result.num_rows(), 2, "ids={ids:?}");
+    assert!(ids.contains(&0), "ids={ids:?}");
+    assert!(ids.contains(&1), "ids={ids:?}");
+    assert!(!ids.contains(&2), "ids={ids:?}");
+    assert!(!ids.contains(&3), "ids={ids:?}");
+}
+
+fn json_batch(values: Vec<&str>) -> RecordBatch {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        ARROW_EXT_NAME_KEY.to_string(),
+        ARROW_JSON_EXT_NAME.to_string(),
+    );
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("json", DataType::Utf8, false).with_metadata(metadata),
+    ]));
+    RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()
+}
+
+async fn json_btree_dataset(initial_values: Vec<&str>, path: &str) -> Dataset {
+    let initial = json_batch(initial_values);
+    let initial_schema = initial.schema();
+    let reader = RecordBatchIterator::new([Ok(initial)], initial_schema);
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": "btree",
+        "path": path,
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_idx".to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+}
+
+#[tokio::test]
+async fn test_compaction_preserves_recorded_json_type() {
+    let mut dataset = json_btree_dataset(vec![r#"{"val": 1}"#, r#"{"val": 2}"#], "val").await;
+    let appended = json_batch(vec![r#"{"val": 3}"#, r#"{"val": 4}"#]);
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let mut indices = dataset.load_indices_by_name("json_idx").await.unwrap();
+    let old_segment = indices[0].clone();
+    let old_id = old_segment.uuid;
+    let mut details: lance_index::pb::JsonIndexDetails =
+        indices[0].index_details.as_ref().unwrap().to_msg().unwrap();
+    details.target_data_type = lance_index::pb::JsonTargetDataType::Int64 as i32;
+    let details = prost_types::Any::from_msg(&details).unwrap();
+    indices[0].index_details = Some(Arc::new(details.clone()));
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: indices,
+            removed_indices: vec![old_segment],
+        },
+        None,
+    );
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+    crate::dataset::optimize::compact_files(
+        &mut dataset,
+        crate::dataset::optimize::CompactionOptions::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 1);
+    let indices = dataset.load_indices_by_name("json_idx").await.unwrap();
+    assert_eq!(indices[0].index_details.as_deref(), Some(&details));
+    assert_ne!(indices[0].uuid, old_id);
+    for indexed in [false, true] {
+        let mut scan = dataset.scan();
+        scan.use_scalar_index(indexed)
+            .filter("json_get_int(json, 'val') >= 2")
+            .unwrap();
+        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 3);
+    }
+}
+
+#[tokio::test]
+async fn test_json_btree_index_statistics() {
+    let dataset = json_btree_dataset(
+        vec![r#"{"val": 1000}"#, r#"{"val": 2000}"#, r#"{"val": 3000}"#],
+        "val",
+    )
+    .await;
+
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics("json_idx").await.unwrap()).unwrap();
+
+    assert_eq!(stats["name"], "json_idx");
+    assert_eq!(stats["num_indices"], 1);
+    assert_eq!(stats["num_indexed_rows"], 3);
+    assert_eq!(stats["num_unindexed_rows"], 0);
+    assert_eq!(stats["indices"][0]["min"], "1000");
+    assert_eq!(stats["indices"][0]["max"], "3000");
+}
+
+/// A JSON-wrapped ngram target always needs a recheck. On legacy (V1) datasets
+/// the legacy scanner rechecks by re-materializing the index expression via
+/// `JsonQuery::to_expr`, so a filtered contains-scan must plan instead of
+/// panicking, and the recheck must drop the ngram false positive.
+#[rstest]
+#[case::legacy(LanceFileVersion::Legacy)]
+#[case::stable(LanceFileVersion::Stable)]
+#[tokio::test]
+async fn test_json_ngram_recheck_scan(#[case] data_storage_version: LanceFileVersion) {
+    let test_uri = TempStrDir::default();
+    let batch = json_batch(vec![
+        r#"{"tag": "unique-bravo"}"#,
+        r#"{"tag": "alpha-charlie"}"#,
+        // Holds every trigram of "bravo" but not the word, so only the
+        // recheck removes it.
+        r#"{"tag": "brazil ravioli avocado"}"#,
+    ]);
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": "ngram",
+        "path": "tag",
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_ngram_idx".to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let result = dataset
+        .scan()
+        .filter("contains(json_get_string(json, 'tag'), 'bravo')")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 1);
+    assert!(
+        result["json"]
+            .as_string::<i32>()
+            .value(0)
+            .contains("unique-bravo")
+    );
+}
+
+#[rstest]
+#[case::merge(false)]
+#[case::append_rebuild(true)]
+#[tokio::test]
+async fn test_optimize_json_btree_index(#[case] append_rebuild: bool) {
+    let mut dataset = json_btree_dataset(vec![r#"{"val": 1000}"#], "val").await;
+
+    for values in [
+        vec![r#"{"val": null}"#, r#"{"val": 2000}"#],
+        vec![r#"{"other": 1}"#, r#"{"val": 3000}"#],
+    ] {
+        let batch = json_batch(values);
+        let schema = batch.schema();
+        dataset
+            .append(RecordBatchIterator::new([Ok(batch)], schema), None)
+            .await
+            .unwrap();
+    }
+
+    let options = if append_rebuild {
+        OptimizeOptions::append()
+    } else {
+        OptimizeOptions::default()
+    };
+    dataset.optimize_indices(&options).await.unwrap();
+
+    let indexed_fragments = dataset
+        .load_indices_by_name("json_idx")
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|index| index.fragment_bitmap.as_ref().unwrap().iter())
+        .collect::<HashSet<_>>();
+    assert_eq!(indexed_fragments, HashSet::from([0, 1, 2]));
+
+    let result = dataset
+        .scan()
+        .filter("json_get_int(json, 'val') >= 2000")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 2);
+
+    // Without stable row ids a row id and a row address coincide, so the
+    // segments keep the pre-migration version older builds can read.
+    for index in dataset.load_indices_by_name("json_idx").await.unwrap() {
+        assert_eq!(
+            index.index_version,
+            lance_index::scalar::json::JSON_ROW_ID_DOMAIN_VERSION as i32
+        );
+    }
+}
+
+fn json_val_batch(values: std::ops::Range<i64>) -> RecordBatch {
+    let docs = values
+        .map(|val| format!(r#"{{"val": {val}}}"#))
+        .collect::<Vec<_>>();
+    json_batch(docs.iter().map(String::as_str).collect())
+}
+
+/// 12 rows over 3 fragments with stable row ids, so row ids and row addresses
+/// differ from the second fragment on.
+async fn stable_row_id_json_dataset(uri: &str) -> Dataset {
+    let batch = json_val_batch(0..12);
+    let schema = batch.schema();
+    Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+fn json_index_params(target_index_type: &str) -> ScalarIndexParams {
+    ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": target_index_type,
+        "path": "val",
+    }))
+}
+
+/// Asserts the JSON index answers `json_get_int(json, 'val') = {val}` for each
+/// of `vals` exactly like a scan that ignores it.
+async fn assert_json_index_matches_scan(dataset: &Dataset, vals: &[i64]) {
+    for val in vals {
+        let predicate = format!("json_get_int(json, 'val') = {val}");
+        let indexed = dataset
+            .scan()
+            .filter(&predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut baseline_scan = dataset.scan();
+        baseline_scan.use_scalar_index(false);
+        let baseline = baseline_scan
+            .filter(&predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(indexed, baseline, "{predicate}");
+    }
+}
+
+/// On a stable-row-id dataset a JSON index over a BTree stores row addresses,
+/// and keeps doing so through a delete, an append, and an optimize that updates
+/// the one existing segment in place. That update must filter the old segment's
+/// data by fragment: a row-id filter would treat every address past the first
+/// fragment as a deleted row and drop it.
+#[tokio::test]
+async fn test_json_btree_row_addr_domain_with_stable_row_ids() {
+    let mut dataset = stable_row_id_json_dataset("memory://").await;
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_idx".to_string()),
+            &json_index_params("btree"),
+            false,
+        )
+        .await
+        .unwrap();
+    let segments = dataset.load_indices_by_name("json_idx").await.unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(
+        segments[0].index_version,
+        lance_index::scalar::json::JSON_ROW_ADDR_DOMAIN_VERSION as i32
+    );
+    assert!(segments[0].results_are_row_addrs());
+
+    dataset
+        .delete("json_get_int(json, 'val') = 5")
+        .await
+        .unwrap();
+    let appended = json_val_batch(12..16);
+    let schema = appended.schema();
+    dataset
+        .append(RecordBatchIterator::new([Ok(appended)], schema), None)
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    let segments = dataset.load_indices_by_name("json_idx").await.unwrap();
+    assert_eq!(segments.len(), 1, "{segments:?}");
+    assert!(segments[0].results_are_row_addrs());
+    assert_json_index_matches_scan(&dataset, &[1, 5, 6, 9, 14]).await;
+}
+
+/// A JSON segment written before `JSON_ROW_ADDR_DOMAIN_VERSION` is version 0.
+/// Optimizing must rebuild it rather than leave it beside (or merge it with)
+/// version-1 data, even in append mode, which selects no segment to merge.
+///
+/// For a BTree target the legacy segment stores row ids. For a ZoneMap target
+/// it already stores row addresses, but its version 0 wrapper is classified as
+/// row ids, so leaving it beside a fresh version 1 segment would mix domains.
+#[rstest]
+#[case::btree("btree")]
+#[case::zonemap("zonemap")]
+#[tokio::test]
+async fn test_optimize_rebuilds_legacy_json_segment_with_stable_row_ids(
+    #[case] target_index_type: &str,
+) {
+    use lance_table::format::IndexMetadata;
+    use prost::Message;
+
+    let mut dataset = stable_row_id_json_dataset("memory://").await;
+    let segment = dataset
+        .create_index_builder(
+            &["json"],
+            IndexType::Scalar,
+            &json_index_params(target_index_type),
+        )
+        .name("json_idx".to_string())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    assert!(segment.results_are_row_addrs());
+
+    // A legacy segment differs from a fresh one only in its versions: the target
+    // loads in whichever domain its recorded version names.
+    let mut details = lance_index::pb::JsonIndexDetails::decode(
+        segment.index_details.as_ref().unwrap().value.as_slice(),
+    )
+    .unwrap();
+    details.target_index_version = None;
+    let legacy_segment = IndexMetadata {
+        index_version: lance_index::scalar::json::JSON_ROW_ID_DOMAIN_VERSION as i32,
+        index_details: Some(Arc::new(prost_types::Any::from_msg(&details).unwrap())),
+        ..segment
+    };
+    assert!(!legacy_segment.results_are_row_addrs());
+    dataset
+        .commit_existing_index_segments("json_idx", "json", vec![legacy_segment])
+        .await
+        .unwrap();
+
+    let appended = json_val_batch(12..16);
+    let schema = appended.schema();
+    dataset
+        .append(RecordBatchIterator::new([Ok(appended)], schema), None)
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    let segments = dataset.load_indices_by_name("json_idx").await.unwrap();
+    assert_eq!(segments.len(), 1, "{segments:?}");
+    assert!(segments[0].results_are_row_addrs());
+    assert_json_index_matches_scan(&dataset, &[1, 6, 9, 14]).await;
+}
+
+#[tokio::test]
+async fn test_optimize_append_json_btree_preserves_float_type() {
+    let mut dataset = json_btree_dataset(vec![r#"{"val": 1.5}"#], "val").await;
+    let appended = json_batch(vec![r#"{"val": 2}"#]);
+    let schema = appended.schema();
+    dataset
+        .append(RecordBatchIterator::new([Ok(appended)], schema), None)
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    let predicate = "json_get_float(json, 'val') = 2.0";
+    let indexed = dataset
+        .scan()
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut baseline_scan = dataset.scan();
+    baseline_scan.use_scalar_index(false);
+    let baseline = baseline_scan
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    assert_eq!(baseline.num_rows(), 1);
+    assert_eq!(indexed.num_rows(), baseline.num_rows());
+}
+
+/// A JSON-wrapped zonemap answers in row addresses, which differ from stable
+/// row ids past fragment 0, so the wrapper must report its target's domain.
+#[tokio::test]
+async fn test_json_zonemap_index_with_stable_row_ids() {
+    let mut dataset = stable_row_id_json_dataset("memory://").await;
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            None,
+            &json_index_params("zonemap"),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let mut scan = dataset.scan();
+    scan.filter("json_get_int(json, 'val') >= 6").unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    let indexed = scan.try_into_batch().await.unwrap();
+    assert_eq!(indexed.num_rows(), 6);
+}
+
+/// `json_extract` evaluates to serialized JSON text (`"click"`, `9`) while a JSON-path
+/// index stores decoded native values (`click`, `9`). The index must decline these
+/// predicates instead of answering them against a different representation.
+///
+/// The cases run sequentially rather than as separate `rstest` cases because each
+/// index build reserves a fixed slice of the shared DataFusion memory pool, and
+/// several concurrent builds exhaust it.
+///
+/// Regression test for https://github.com/lance-format/lance/issues/8806.
+#[tokio::test]
+async fn test_json_extract_matches_unindexed_results() {
+    let cases = [
+        (
+            vec![
+                r#"{"val": "click"}"#,
+                r#"{"val": "view"}"#,
+                r#"{"val": "click"}"#,
+            ],
+            r#"json_extract(json, 'val') = '"click"'"#,
+        ),
+        (
+            vec![r#"{"val": "a"}"#, r#"{"val": "m"}"#, r#"{"val": "z"}"#],
+            r#"json_extract(json, 'val') > '"m"'"#,
+        ),
+        (
+            vec![r#"{"val": 9}"#, r#"{"val": 10}"#, r#"{"val": 9}"#],
+            "json_extract(json, 'val') = '9'",
+        ),
+        (
+            vec![r#"{"val": 9}"#, r#"{"val": 10}"#, r#"{"val": 100}"#],
+            "json_extract(json, 'val') < '100'",
+        ),
+    ];
+
+    fn sorted_matches(batch: &RecordBatch) -> Vec<String> {
+        let mut rows = batch
+            .column_by_name("json")
+            .unwrap()
+            .as_string::<i32>()
+            .iter()
+            .map(|value| value.unwrap().to_string())
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    for (values, predicate) in cases {
+        let dataset = json_btree_dataset(values, "val").await;
+
+        let indexed = dataset
+            .scan()
+            .filter(predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut baseline_scan = dataset.scan();
+        baseline_scan.use_scalar_index(false);
+        let baseline = baseline_scan
+            .filter(predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Guard against both scans matching nothing, which would pass vacuously.
+        assert!(baseline.num_rows() > 0, "no rows matched {predicate}");
+        assert_eq!(
+            sorted_matches(&indexed),
+            sorted_matches(&baseline),
+            "index changed results for {predicate}"
+        );
+    }
+}
+
+/// Regression test for https://github.com/lance-format/lance/issues/9257.
+#[tokio::test]
+async fn test_nested_json_path_typed_accessor_matches_unindexed_results() {
+    let path = "$.user.age";
+    let dataset = json_btree_dataset(
+        vec![r#"{"user": {"age": 30}}"#, r#"{"user": {"age": 40}}"#],
+        path,
+    )
+    .await;
+    let predicate = format!("json_get_int(json, '{path}') = 30");
+
+    let indexed = dataset
+        .scan()
+        .filter(&predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut baseline_scan = dataset.scan();
+    baseline_scan.use_scalar_index(false);
+    let baseline = baseline_scan
+        .filter(&predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    assert_eq!(baseline.num_rows(), 0);
+    assert_eq!(indexed.num_rows(), baseline.num_rows());
+}
+
+async fn prepare_json_dataset() -> (Dataset, String) {
+    let text_col = Arc::new(StringArray::from(vec![
+        r#"{
+          "Title": "HarryPotter Chapter One",
+          "Content": "Mr. and Mrs. Dursley, of number four, Privet Drive, were proud to say...",
+          "Author": "J.K. Rowling",
+          "Price": 128,
+          "Language": ["english", "chinese"]
+      }"#,
+        r#"{
+         "Title": "Fairy Talest",
+         "Content": "Once upon a time, on a bitterly cold New Year's Eve, a little girl...",
+         "Author": "ANDERSEN",
+         "Price": 50,
+         "Language": ["english", "chinese"]
+      }"#,
+    ]));
+    let json_col = "json_field".to_string();
+
+    // Prepare dataset
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        ARROW_EXT_NAME_KEY.to_string(),
+        ARROW_JSON_EXT_NAME.to_string(),
+    );
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata),
+        ])
+        .into(),
+        vec![text_col.clone()],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let dataset = Dataset::write(stream, "memory://test/table", None)
+        .await
+        .unwrap();
+
+    (dataset, json_col)
+}
+
+#[tokio::test]
+async fn test_json_inverted_fuzziness_query() {
+    let (mut dataset, json_col) = prepare_json_dataset().await;
+
+    // Create inverted index for json col
+    dataset
+        .create_index(
+            &[&json_col],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default().lance_tokenizer("json".to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Match query with fuzziness
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Match(
+            MatchQuery::new("Content,str,Dursley".to_string()).with_column(Some(json_col.clone())),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(1, batch.num_rows());
+
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Match(
+            MatchQuery::new("Content,str,Bursley".to_string()).with_column(Some(json_col.clone())),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(0, batch.num_rows());
+
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Match(
+            MatchQuery::new("Content,str,Bursley".to_string())
+                .with_column(Some(json_col.clone()))
+                .with_fuzziness(Some(1)),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(1, batch.num_rows());
+
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Match(
+            MatchQuery::new("Content,str,ABursley".to_string())
+                .with_column(Some(json_col.clone()))
+                .with_fuzziness(Some(1)),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(0, batch.num_rows());
+
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Match(
+            MatchQuery::new("Content,str,ABursley".to_string())
+                .with_column(Some(json_col.clone()))
+                .with_fuzziness(Some(2)),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(1, batch.num_rows());
+
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Match(
+            MatchQuery::new("Dontent,str,Bursley".to_string())
+                .with_column(Some(json_col.clone()))
+                .with_fuzziness(Some(2)),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(0, batch.num_rows());
+}
+
+#[tokio::test]
+async fn test_json_inverted_match_query() {
+    let (mut dataset, json_col) = prepare_json_dataset().await;
+
+    // Create inverted index for json col, with max token len 10 and enable stemming,
+    // lower case, and remove stop words
+    dataset
+        .create_index(
+            &[&json_col],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .lance_tokenizer("json".to_string())
+                .max_token_length(Some(10))
+                .stem(true)
+                .lower_case(true)
+                .remove_stop_words(true),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Match query with token length exceed max token length
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Match(
+            MatchQuery::new("Title,str,harrypotter".to_string())
+                .with_column(Some(json_col.clone())),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(0, batch.num_rows());
+
+    // Match query with stemming
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Match(
+            MatchQuery::new("Content,str,onc".to_string()).with_column(Some(json_col.clone())),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(1, batch.num_rows());
+
+    // Match query with lower case
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Match(
+            MatchQuery::new("Content,str,DURSLEY".to_string()).with_column(Some(json_col.clone())),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(1, batch.num_rows());
+
+    // Match query with stop word
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Match(
+            MatchQuery::new("Content,str,and".to_string()).with_column(Some(json_col.clone())),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(0, batch.num_rows());
+}
+
+#[tokio::test]
+async fn test_json_inverted_flat_match_query() {
+    let (mut dataset, json_col) = prepare_json_dataset().await;
+
+    // Create inverted index for json col
+    dataset
+        .create_index(
+            &[&json_col],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .lance_tokenizer("json".to_string())
+                .stem(false),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Append data
+    let text_col = Arc::new(StringArray::from(vec![
+        r#"{
+          "Title": "HarryPotter Chapter Two",
+          "Content": "Nearly ten years had passed since the Dursleys had woken up...",
+          "Author": "J.K. Rowling",
+          "Price": 128,
+          "Language": ["english", "chinese"]
+        }"#,
+    ]));
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        ARROW_EXT_NAME_KEY.to_string(),
+        ARROW_JSON_EXT_NAME.to_string(),
+    );
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata),
+        ])
+        .into(),
+        vec![text_col.clone()],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    dataset.append(stream, None).await.unwrap();
+
+    // Test match query
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Match(
+            MatchQuery::new("Title,str,harrypotter".to_string())
+                .with_column(Some(json_col.clone())),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(2, batch.num_rows());
+}
+
+#[tokio::test]
+async fn test_json_inverted_phrase_query() {
+    // Prepare json dataset
+    let (mut dataset, json_col) = prepare_json_dataset().await;
+
+    // Create inverted index for json col
+    dataset
+        .create_index(
+            &[&json_col],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .lance_tokenizer("json".to_string())
+                .stem(false)
+                .with_position(true),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Test phrase query
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Phrase(
+            PhraseQuery::new("Title,str,harrypotter one chapter".to_string())
+                .with_column(Some(json_col.clone())),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(0, batch.num_rows());
+
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Phrase(
+            PhraseQuery::new("Title,str,harrypotter chapter one".to_string())
+                .with_column(Some(json_col.clone())),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(1, batch.num_rows());
+}
+
+#[tokio::test]
+async fn test_json_inverted_multimatch_query() {
+    // Prepare json dataset
+    let (mut dataset, json_col) = prepare_json_dataset().await;
+
+    // Create inverted index for json col
+    dataset
+        .create_index(
+            &[&json_col],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .lance_tokenizer("json".to_string())
+                .stem(false),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Test multi match query
+    let query = FullTextSearchQuery {
+        query: FtsQuery::MultiMatch(MultiMatchQuery {
+            match_queries: vec![
+                MatchQuery::new("Title,str,harrypotter".to_string())
+                    .with_column(Some(json_col.clone())),
+                MatchQuery::new("Language,str,english".to_string())
+                    .with_column(Some(json_col.clone())),
+            ],
+        }),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(2, batch.num_rows());
+}
+
+#[tokio::test]
+async fn test_json_inverted_boolean_query() {
+    // Prepare json dataset
+    let (mut dataset, json_col) = prepare_json_dataset().await;
+
+    // Create inverted index for json col
+    dataset
+        .create_index(
+            &[&json_col],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .lance_tokenizer("json".to_string())
+                .stem(false),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Test boolean query
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Boolean(BooleanQuery {
+            should: vec![],
+            must: vec![
+                FtsQuery::Match(
+                    MatchQuery::new("Language,str,english".to_string())
+                        .with_column(Some(json_col.clone())),
+                ),
+                FtsQuery::Match(
+                    MatchQuery::new("Title,str,harrypotter".to_string())
+                        .with_column(Some(json_col.clone())),
+                ),
+            ],
+            must_not: vec![],
+        }),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(1, batch.num_rows());
+}
+
+#[tokio::test]
+async fn test_sql_contains_tokens() {
+    let text_col = Arc::new(StringArray::from(vec![
+        "a cat catch a fish",
+        "a fish catch a cat",
+        "a white cat catch a big fish",
+        "cat catchup fish",
+        "cat fish catch",
+    ]));
+
+    // Prepare dataset
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+        vec![text_col.clone()],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(stream, "memory://test/table", None)
+        .await
+        .unwrap();
+
+    // A NULL query matches no row, with or without an index.
+    let count_null_query_matches = |dataset: Dataset| async move {
+        execute_sql(
+            "select * from foo where contains_tokens(text, NULL)",
+            "foo".to_string(),
+            Arc::new(dataset),
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum::<usize>()
+    };
+    assert_eq!(count_null_query_matches(dataset.clone()).await, 0);
+
+    // Test without fts index
+    let results = execute_sql(
+        "select * from foo where contains_tokens(text, 'cat catch fish')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_results(
+        results,
+        &StringArray::from(vec![
+            "a cat catch a fish",
+            "a fish catch a cat",
+            "a white cat catch a big fish",
+            "cat fish catch",
+        ]),
+    );
+
+    // Verify plan, should not contain ScalarIndexQuery.
+    let results = execute_sql(
+        "explain select * from foo where contains_tokens(text, 'cat catch fish')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+    let plan = format!("{:?}", results);
+    assert_not_contains!(&plan, "ScalarIndexQuery");
+
+    // Test with unsuitable fts index
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default().base_tokenizer("raw".to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let results = execute_sql(
+        "select * from foo where contains_tokens(text, 'cat catch fish')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_results(
+        results,
+        &StringArray::from(vec![
+            "a cat catch a fish",
+            "a fish catch a cat",
+            "a white cat catch a big fish",
+            "cat fish catch",
+        ]),
+    );
+
+    // Verify plan, should not contain ScalarIndexQuery because fts index is not unsuitable.
+    let results = execute_sql(
+        "explain select * from foo where contains_tokens(text, 'cat catch fish')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+    let plan = format!("{:?}", results);
+    assert_not_contains!(&plan, "ScalarIndexQuery");
+
+    // Test with suitable fts index
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .max_token_length(None)
+                .stem(false),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let results = execute_sql(
+        "select * from foo where contains_tokens(text, 'cat catch fish')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_results(
+        results,
+        &StringArray::from(vec![
+            "a cat catch a fish",
+            "a fish catch a cat",
+            "a white cat catch a big fish",
+            "cat fish catch",
+        ]),
+    );
+
+    // Verify plan, should contain ScalarIndexQuery.
+    let results = execute_sql(
+        "explain select * from foo where contains_tokens(text, 'cat catch fish')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+    let plan = format!("{:?}", results);
+    assert_contains!(&plan, "ScalarIndexQuery");
+    assert_eq!(count_null_query_matches(dataset.clone()).await, 0);
+
+    // The index drops stop words, and a query with no tokens left must still
+    // match the rows the scan matches.
+    for (query, expected) in [
+        (
+            "a",
+            vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+            ],
+        ),
+        (
+            "",
+            vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+                "cat catchup fish",
+                "cat fish catch",
+            ],
+        ),
+    ] {
+        let results = execute_sql(
+            &format!("select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        assert_results(results, &StringArray::from(expected));
+
+        // The index cannot narrow such a query, so the plan leaves it to the scan.
+        let results = execute_sql(
+            &format!("explain select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        let plan = format!("{:?}", results);
+        assert_not_contains!(&plan, "ScalarIndexQuery");
+    }
+
+    // Counting reads the index result directly unless it needs a recheck, and
+    // the index lowercases and drops stop words.
+    for (query, expected) in [("a cat", 3), ("A", 0), ("cat catch fish", 4)] {
+        let count = dataset
+            .count_rows(Some(format!("contains_tokens(text, '{query}')")))
+            .await
+            .unwrap();
+        assert_eq!(
+            count, expected,
+            "count_rows of contains_tokens(text, '{query}')"
+        );
+    }
+
+    let appended = arrow_array::record_batch!(("text", Utf8, ["cat catch fish", "dog"])).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema());
+    dataset.append(reader, None).await.unwrap();
+
+    let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .filter("contains_tokens(text, 'cat catch fish')")
+        .unwrap()
+        .with_ignored_scalar_indices([index_name]);
+    let plan = scanner.explain_plan(true).await.unwrap();
+    assert_not_contains!(&plan, "ScalarIndexQuery");
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_results(
+        vec![batch],
+        &StringArray::from(vec![
+            "a cat catch a fish",
+            "a fish catch a cat",
+            "a white cat catch a big fish",
+            "cat fish catch",
+            "cat catch fish",
+        ]),
+    );
+}
+
+/// An ngram FTS index with positions, which 13.0.0 could create and current
+/// versions refuse to, still loads, takes appended rows and answers queries.
+#[rstest]
+#[tokio::test]
+async fn test_existing_ngram_index_with_positions_keeps_working(
+    #[values(false, true)] merge: bool,
+) {
+    let test_dir =
+        copy_test_data_to_tmp("v13.0.0/ngram_with_position/ngram_with_position.lance").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let schema = Arc::new(dataset.schema().into());
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["yellow"]))]).unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let options = if merge {
+        OptimizeOptions::merge(2)
+    } else {
+        OptimizeOptions::append()
+    };
+    dataset.optimize_indices(&options).await.unwrap();
+
+    let results = dataset
+        .scan()
+        .project(&["text"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("ello".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut texts = results["text"]
+        .as_string::<i32>()
+        .iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    texts.sort_unstable();
+    assert_eq!(texts, ["hello world", "world hello", "yellow"]);
+
+    // Copying the index to another dataset keeps its settings.
+    let target_dir = TempStrDir::default();
+    let rows = dataset
+        .scan()
+        .project(&["text"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(rows.clone())], rows.schema());
+    let mut target = Dataset::write(reader, &target_dir, None).await.unwrap();
+    target.initialize_indices(&dataset).await.unwrap();
+    let copied = target.load_indices().await.unwrap();
+    assert_eq!(copied.len(), 1);
+    let copied_params = load_scalar_segment_params(&target, &copied[0])
+        .await
+        .unwrap();
+    let copied_params: serde_json::Value =
+        serde_json::from_str(copied_params.params.as_deref().unwrap()).unwrap();
+    assert_eq!(copied_params["base_tokenizer"], "ngram");
+    assert_eq!(copied_params["with_position"], true);
+
+    // Creating such an index anew is rejected.
+    let params = InvertedIndexParams::default()
+        .base_tokenizer("ngram".to_string())
+        .with_position(true);
+    let err = dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    assert!(
+        err.to_string()
+            .contains("with_position is not supported with base_tokenizer='ngram'"),
+        "{err}"
+    );
+}
+
+/// On legacy storage the index result is materialized before the recheck. The
+/// query parser does not see the index's custom stop words: 'cat' reaches the
+/// index, which drops it, and 'a' is dropped by the parser but not the index.
+/// Both must match the rows the scan matches.
+#[tokio::test]
+async fn test_sql_contains_tokens_custom_stop_words_on_legacy_storage() {
+    let text_col = Arc::new(StringArray::from(vec![
+        "a cat catch a fish",
+        "a fish catch a cat",
+        "dog fish",
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+        vec![text_col],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let params = WriteParams {
+        data_storage_version: Some(LanceFileVersion::Legacy),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(stream, "memory://", Some(params))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .max_token_length(None)
+                .stem(false)
+                // Not a built-in stop word, so only the index's own list drops it.
+                .custom_stop_words(Some(vec!["cat".to_string()])),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for query in ["cat", "a"] {
+        let results = execute_sql(
+            &format!("select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        assert_results(
+            results,
+            &StringArray::from(vec!["a cat catch a fish", "a fish catch a cat"]),
+        );
+    }
+
+    // 'cat' reaches the index because the parser cannot see the custom stop
+    // words, so this covers the rechecked AtLeast materialization path.
+    let results = execute_sql(
+        "explain select * from foo where contains_tokens(text, 'cat')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+    let plan = format!("{:?}", results);
+    assert_contains!(&plan, "MaterializeIndex");
+}
+
+/// A negated filter answered by the index on a legacy-storage dataset with
+/// stable row ids, restricted to one fragment: the index's block list spans
+/// every fragment, so it is longer than the scanned fragment.
+#[tokio::test]
+async fn test_not_equal_filter_on_fragment_subset_legacy_stable_row_ids() {
+    let reader = gen_batch()
+        .col("c", array::cycle::<UInt64Type>(vec![0, 1]))
+        .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            enable_stable_row_ids: true,
+            max_rows_per_file: 10,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["c"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let mut scan = dataset.scan();
+    scan.with_fragments(vec![dataset.get_fragment(0).unwrap().metadata().clone()])
+        .filter("c != 0")
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert_contains!(&plan, "MaterializeIndex");
+    assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 5);
+}
+
+#[tokio::test]
+async fn test_index_take_batch_size() -> Result<()> {
+    use tempfile::tempdir;
+    let temp_dir = tempdir()?;
+
+    let dataset_path = temp_dir.path().join("ints_dataset");
+    let values: Vec<i32> = (0..1024).collect();
+    let array = Int32Array::from(values);
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "ints",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)])?;
+    let write_params = WriteParams {
+        mode: WriteMode::Create,
+        max_rows_per_file: 100,
+        ..Default::default()
+    };
+    let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    Dataset::write(
+        batch_reader,
+        dataset_path.to_str().unwrap(),
+        Some(write_params),
+    )
+    .await?;
+    let mut dataset = Dataset::open(dataset_path.to_str().unwrap()).await?;
+    dataset
+        .create_index(
+            &["ints"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await?;
+
+    let mut scanner = dataset.scan();
+    scanner.batch_size(50).filter("ints > 0")?.with_row_id();
+    let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(1023, total_rows);
+    assert_eq!(21, batches.len());
+
+    let mut scanner = dataset.scan();
+    scanner
+        .batch_size(50)
+        .filter("ints > 0")?
+        .limit(Some(1024), None)?
+        .with_row_id();
+    let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(1023, total_rows);
+    assert_eq!(21, batches.len());
+
+    let dataset_path2 = temp_dir.path().join("strings_dataset");
+    let strings: Vec<String> = (0..1024).map(|i| format!("string-{}", i)).collect();
+    let string_array = StringArray::from(strings);
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "strings",
+        DataType::Utf8,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(string_array)])?;
+    let write_params = WriteParams {
+        mode: WriteMode::Create,
+        max_rows_per_file: 100,
+        ..Default::default()
+    };
+    let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    Dataset::write(
+        batch_reader,
+        dataset_path2.to_str().unwrap(),
+        Some(write_params),
+    )
+    .await?;
+    let mut dataset2 = Dataset::open(dataset_path2.to_str().unwrap()).await?;
+    dataset2
+        .create_index(
+            &["strings"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await?;
+
+    let mut scanner = dataset2.scan();
+    scanner
+        .batch_size(50)
+        .filter("contains(strings, 'ing')")?
+        .limit(Some(1024), None)?
+        .with_row_id();
+    let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(1024, total_rows);
+    assert_eq!(21, batches.len());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_auto_infer_lance_tokenizer() {
+    let (mut dataset, json_col) = prepare_json_dataset().await;
+
+    // Create inverted index for json col. Expect auto-infer 'json' for lance tokenizer.
+    dataset
+        .create_index(
+            &[&json_col],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Match query succeed only when lance tokenizer is 'json'
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Match(
+            MatchQuery::new("Content,str,once".to_string()).with_column(Some(json_col.clone())),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(1, batch.num_rows());
+}
+
+#[tokio::test]
+async fn test_index_inherits_dataset_file_version() {
+    // Test that index files use the same format version as the dataset
+    let test_uri = TempStrDir::default();
+
+    let dimension = 16;
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "embeddings",
+        DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            dimension,
+        ),
+        false,
+    )]));
+
+    let float_arr = generate_random_array(512 * dimension as usize);
+    let vectors = Arc::new(
+        <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+            float_arr, dimension,
+        )
+        .unwrap(),
+    );
+    let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
+
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+    // Create dataset with V2_1 file version
+    let dataset_version = LanceFileVersion::V2_1;
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(dataset_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Create a vector index
+    let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
+    let index_meta = dataset
+        .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    // Get the index directory
+    let index_dir = dataset.indices_dir().join(index_meta.uuid.to_string());
+
+    // Open the index file and check its version
+    let index_path = index_dir.clone().join("index.idx");
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
+
+    let file_handle = scheduler
+        .open_file(&index_path, &CachedFileSize::unknown())
+        .await
+        .unwrap();
+
+    let index_reader = FileReader::try_open(
+        file_handle,
+        None,
+        Arc::default(),
+        &LanceCache::no_cache(),
+        FileReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    // Verify that the index file uses the same version as the dataset
+    assert_eq!(
+        index_reader.metadata().version(),
+        dataset_version.resolve(),
+        "Index file should use the same format version as the dataset"
+    );
+
+    // Also check the auxiliary file if it exists
+    let aux_path = index_dir.clone().join("auxiliary.idx");
+    if dataset
+        .object_store
+        .exists(&aux_path)
+        .await
+        .unwrap_or(false)
+    {
+        let aux_handle = scheduler
+            .open_file(&aux_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+
+        let aux_reader = FileReader::try_open(
+            aux_handle,
+            None,
+            Arc::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            aux_reader.metadata().version(),
+            dataset_version.resolve(),
+            "Auxiliary index file should use the same format version as the dataset"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_legacy_dataset_uses_v2_0_for_indexes() {
+    // Test that datasets with legacy format still use V2_0 for indexes (not legacy)
+    let test_uri = TempStrDir::default();
+
+    let dimension = 16;
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "embeddings",
+        DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            dimension,
+        ),
+        false,
+    )]));
+
+    let float_arr = generate_random_array(512 * dimension as usize);
+    let vectors = Arc::new(
+        <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+            float_arr, dimension,
+        )
+        .unwrap(),
+    );
+    let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
+
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+    // Create dataset with legacy file version
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Create a vector index
+    let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
+    let index_meta = dataset
+        .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    // Get the index directory
+    let index_dir = dataset.indices_dir().join(index_meta.uuid.to_string());
+
+    // Open the index file and check its version
+    let index_path = index_dir.clone().join("index.idx");
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
+
+    let file_handle = scheduler
+        .open_file(&index_path, &CachedFileSize::unknown())
+        .await
+        .unwrap();
+
+    let index_reader = FileReader::try_open(
+        file_handle,
+        None,
+        Arc::default(),
+        &LanceCache::no_cache(),
+        FileReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    // Verify that the index file uses V2_0 (not legacy)
+    assert_eq!(
+        index_reader.metadata().version(),
+        ConcreteFileVersion::V2_0,
+        "Index files should never use legacy format, even for legacy datasets"
+    );
+}
+
+#[tokio::test]
+async fn test_manifest_read_recovers_from_stale_size() {
+    // A cached `ManifestLocation.size` can lag the real object: a reader may pick
+    // up a size from a stale listing/hint while another writer is committing
+    // concurrently. Reading the manifest (or its index section) with that stale
+    // size must not fail with a spurious "file size is too small" error. The
+    // reader should drop the cached size, fetch the true size, and succeed.
+    use crate::session::Session;
+    use lance_table::io::commit::ManifestLocation;
+    use lance_table::io::manifest::read_manifest_indexes;
+
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from((0..100).collect::<Vec<i32>>()))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let real_location = dataset.manifest_location().clone();
+    assert!(real_location.size.is_some());
+
+    // A deliberately-too-small size stands in for a stale cached size. Without the
+    // retry, both reads below decode a bogus footer offset and fail with
+    // "file size is too small".
+    let stale_location = ManifestLocation {
+        size: Some(1),
+        ..real_location.clone()
+    };
+
+    let session = Session::default();
+    let manifest = Dataset::load_manifest(
+        dataset.object_store.as_ref(),
+        &stale_location,
+        test_uri.as_ref(),
+        &session,
+    )
+    .await
+    .expect("load_manifest should recover from a stale manifest size");
+    assert_eq!(manifest.version, real_location.version);
+
+    let indices = read_manifest_indexes(dataset.object_store.as_ref(), &stale_location, &manifest)
+        .await
+        .expect("read_manifest_indexes should recover from a stale manifest size");
+    assert_eq!(indices.len(), 1);
+    assert_eq!(indices[0].name, "id_idx");
+
+    // Long enough for a footer, but what ends there is not one: this is not a damaged file.
+    let short_location = ManifestLocation {
+        size: real_location.size.map(|size| size - 1),
+        ..real_location.clone()
+    };
+    let manifest = Dataset::load_manifest(
+        dataset.object_store.as_ref(),
+        &short_location,
+        test_uri.as_ref(),
+        &session,
+    )
+    .await
+    .expect("load_manifest should recover from a stale manifest size");
+    assert_eq!(manifest.version, real_location.version);
+}
+
+#[rstest]
+#[case::btree("btree", Some(2))]
+#[case::bitmap("bitmap", None)]
+#[tokio::test]
+async fn test_load_scalar_segment_params(#[case] index_type: &str, #[case] zone_size: Option<u64>) {
+    let test_uri = TempStrDir::default();
+    let batch = arrow_array::record_batch!(
+        (
+            "value",
+            Int32,
+            [Some(1), None, Some(3), Some(2), None, Some(4)]
+        ),
+        ("payload", Int32, [10, 20, 30, 40, 50, 60])
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+
+    let mut params = ScalarIndexParams::new(index_type.to_string());
+    if zone_size.is_some() {
+        params = params.with_params(&BTreeParameters {
+            zone_size,
+            range_id: None,
+        });
+    }
+    dataset
+        .create_index(&["value"], IndexType::Scalar, None, &params, false)
+        .await
+        .unwrap();
+    drop(dataset);
+
+    let mut dataset = Dataset::open(test_uri.as_str()).await.unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    let recovered = load_scalar_segment_params(&dataset, &indices[0])
+        .await
+        .unwrap();
+    assert_eq!(recovered.index_type, index_type);
+    if let Some(zone_size) = zone_size {
+        let recovered_btree: BTreeParameters =
+            serde_json::from_str(recovered.params.as_deref().unwrap()).unwrap();
+        assert_eq!(recovered_btree.zone_size, Some(zone_size));
+    } else {
+        assert_eq!(recovered.params, None);
+    }
+    let opened = dataset
+        .open_scalar_index("value", &indices[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(recovered, opened.derive_index_params().unwrap());
+
+    let mut covered = indices[0].clone();
+    let payload_id = dataset.schema().field_id("payload").unwrap();
+    covered.fields.push(payload_id);
+    covered.covering_fields.push(payload_id);
+    assert_eq!(
+        load_scalar_segment_params(&dataset, &covered)
+            .await
+            .unwrap(),
+        recovered
+    );
+
+    dataset
+        .create_index(&["value"], IndexType::Scalar, None, &recovered, true)
+        .await
+        .unwrap();
+    let result = dataset
+        .scan()
+        .filter("value = 3 OR value IS NULL")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 3);
+    assert_eq!(result["value"].null_count(), 2);
+}
+
+#[tokio::test]
+async fn test_load_scalar_segment_params_json_rebuild_preserves_type() {
+    let test_uri = TempStrDir::default();
+    let batch = json_batch(vec![
+        r#"{"val": 1}"#,
+        r#"{"val": 2}"#,
+        r#"{"val": null}"#,
+        r#"{"other": 3}"#,
+        r#"{"val": null}"#,
+        r#"{}"#,
+    ]);
+    let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 3);
+
+    let target_params = BTreeParameters {
+        zone_size: Some(2),
+        range_id: None,
+    };
+    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "path": "val",
+        "target_index_type": "btree",
+        "target_index_parameters": serde_json::to_string(&target_params).unwrap(),
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_idx".to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    drop(dataset);
+
+    let mut dataset = Dataset::open(test_uri.as_str()).await.unwrap();
+    let segments = dataset.load_indices_by_name("json_idx").await.unwrap();
+    let recovered = load_scalar_segment_params(&dataset, &segments[0])
+        .await
+        .unwrap();
+    assert_eq!(recovered.index_type, "json");
+    let recovered_json: serde_json::Value =
+        serde_json::from_str(recovered.params.as_deref().unwrap()).unwrap();
+    assert_eq!(recovered_json["path"], "val");
+    assert_eq!(recovered_json["target_index_type"], "btree");
+    assert_eq!(recovered_json["target_data_type"], "Int64");
+    let recovered_target: BTreeParameters =
+        serde_json::from_str(recovered_json["target_index_parameters"].as_str().unwrap()).unwrap();
+    assert_eq!(recovered_target.zone_size, Some(2));
+
+    // These fragments have no non-null path values from which to infer Int64.
+    dataset
+        .create_index_builder(&["json"], IndexType::Scalar, &recovered)
+        .name("json_idx".to_string())
+        .replace(true)
+        .fragments(vec![1, 2])
+        .await
+        .unwrap();
+    drop(dataset);
+
+    let dataset = Dataset::open(test_uri.as_str()).await.unwrap();
+    let segments = dataset.load_indices_by_name("json_idx").await.unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(
+        segments[0].fragment_bitmap.as_ref().unwrap(),
+        &roaring::RoaringBitmap::from_iter([1, 2])
+    );
+    assert_eq!(
+        load_scalar_segment_params(&dataset, &segments[0])
+            .await
+            .unwrap(),
+        recovered
+    );
+    let opened = dataset
+        .open_scalar_index("json", &segments[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(opened.training_data_type(), Some(DataType::Int64));
+
+    let predicate = "json_get_int(json, 'val') IS NULL";
+    let result = dataset
+        .scan()
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut baseline = dataset.scan();
+    baseline.use_scalar_index(false);
+    let baseline = baseline
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 4);
+    assert_eq!(result, baseline);
+}
+
+#[rstest]
+#[case::no_key(vec![], false, "one keyed field")]
+#[case::multiple_keys(vec![0, 1], false, "one keyed field")]
+#[case::vector(vec![0], true, "vector index")]
+#[tokio::test]
+async fn test_load_scalar_segment_params_rejects_invalid_metadata(
+    #[case] fields: Vec<i32>,
+    #[case] is_vector: bool,
+    #[case] message: &str,
+) {
+    let batch =
+        arrow_array::record_batch!(("value", Int32, [1, 2]), ("other", Int32, [3, 4])).unwrap();
+    let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    let mut segment = dataset
+        .create_index(
+            &["value"],
+            IndexType::Bitmap,
+            None,
+            &ScalarIndexParams::new("bitmap".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+    segment.fields = fields;
+    if is_vector {
+        segment.index_details = Some(Arc::new(
+            prost_types::Any::from_msg(&VectorIndexDetails::default()).unwrap(),
+        ));
+    }
+    let error = load_scalar_segment_params(&dataset, &segment)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert_contains!(error.to_string(), message);
+}
+
+/// Both parameter loaders must match the fully opened segment's params,
+/// including `custom_stop_words`, without populating the index cache.
+#[rstest]
+#[case::row(DocumentGranularity::Row, InvertedListFormatVersion::V2)]
+#[case::list_element_v2(DocumentGranularity::ListElement, InvertedListFormatVersion::V2)]
+#[case::list_element_v3(DocumentGranularity::ListElement, InvertedListFormatVersion::V3)]
+#[tokio::test]
+async fn test_load_segment_params_full_fidelity(
+    #[case] granularity: DocumentGranularity,
+    #[case] format_version: InvertedListFormatVersion,
+) {
+    let mut text = GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
+    text.values().append_value("the quick brown fox");
+    text.values().append_null();
+    text.append(true);
+    text.append(false);
+    text.append(true);
+    text.values().append_value("lazy dogs sleep");
+    text.append(true);
+    let batch =
+        RecordBatch::try_from_iter([("text", Arc::new(text.finish()) as ArrayRef)]).unwrap();
+    let schema = batch.schema();
+    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(
+        stream,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+
+    let params = InvertedIndexParams::default()
+        .custom_stop_words(Some(vec!["quick".to_string()]))
+        .document_granularity(granularity)
+        .format_version(format_version);
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let segments = crate::index::scalar::load_segments(&dataset, "text", granularity)
+        .await
+        .unwrap()
+        .expect("FTS index segments");
+    dataset.session().index_cache.clear().await;
+    let cache_entries = dataset.index_cache_entry_count().await;
+    let read = crate::index::scalar::load_segment_params(&dataset, &segments[0])
+        .await
+        .unwrap();
+    let recovered = load_scalar_segment_params(&dataset, &segments[0])
+        .await
+        .unwrap();
+    assert_eq!(dataset.index_cache_entry_count().await, cache_entries);
+
+    let generic = dataset
+        .open_generic_index("text", &segments[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let opened = generic
+        .as_any()
+        .downcast_ref::<InvertedIndex>()
+        .expect("inverted index");
+    // The typed loader reads only the physical tokenizer parameters.
+    assert_eq!(&read.document_granularity(granularity), opened.params());
+    let derived = opened.derive_index_params().unwrap();
+    assert_eq!(recovered.index_type, derived.index_type);
+    let recovered_json: serde_json::Value =
+        serde_json::from_str(recovered.params.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        recovered_json["document_granularity"],
+        serde_json::to_value(granularity).unwrap()
+    );
+    assert_eq!(
+        recovered_json["format_version"],
+        format_version.index_version()
+    );
+    assert_eq!(
+        recovered_json,
+        serde_json::from_str::<serde_json::Value>(derived.params.as_deref().unwrap()).unwrap()
+    );
+    assert!(dataset.index_cache_entry_count().await > cache_entries);
+}
+
+#[rstest]
+#[case::legacy("0.27.0/legacy_fts_index")]
+#[case::v1("v3.0.1/fts_v1")]
+#[case::v2("v4.0.1/fts_v2")]
+#[tokio::test]
+async fn test_load_scalar_segment_params_legacy_fts(
+    #[case] fixture_path: &str,
+    #[values(false, true)] omit_details: bool,
+) {
+    let test_dir = copy_test_data_to_tmp(fixture_path).unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 1);
+    let mut segment = indices[0].clone();
+    if omit_details {
+        segment.index_details = None;
+    }
+    let recovered = load_scalar_segment_params(&dataset, &segment)
+        .await
+        .unwrap();
+
+    let opened = dataset
+        .open_scalar_index("text", &indices[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let derived = opened.derive_index_params().unwrap();
+    assert_eq!(recovered.index_type, derived.index_type);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(recovered.params.as_deref().unwrap()).unwrap(),
+        serde_json::from_str::<serde_json::Value>(derived.params.as_deref().unwrap()).unwrap()
+    );
+}
+
+/// Compaction of a covered index must succeed. `remap_index` rejected any
+/// index with more than one field, so this failed outright -- a covered
+/// dataset could be created but never compacted.
+#[tokio::test]
+async fn test_compaction_withdraws_a_covered_index_without_failing() {
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+
+    let test_uri = TempStrDir::default();
+    let dimension = 16;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                dimension,
+            ),
+            false,
+        ),
+        ArrowField::new("payload", DataType::Int32, false),
+    ]));
+
+    let make_batch = |offset: i32| {
+        let vectors = Arc::new(
+            <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                generate_random_array(256 * dimension as usize),
+                dimension,
+            )
+            .unwrap(),
+        );
+        let payload = Arc::new(Int32Array::from_iter_values(offset..offset + 256));
+        RecordBatch::try_new(schema.clone(), vec![vectors, payload]).unwrap()
+    };
+
+    // Two fragments, so compaction has something to compact.
+    let reader = RecordBatchIterator::new(vec![Ok(make_batch(0))], schema.clone());
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(make_batch(256))], schema.clone());
+    dataset.append(reader, None).await.unwrap();
+
+    let params = VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 50);
+    dataset
+        .create_index(&["vec"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    let vec_id = dataset.schema().field_id("vec").unwrap();
+    let payload_id = dataset.schema().field_id("payload").unwrap();
+    let current = dataset.load_indices().await.unwrap();
+    let mut covered = current[0].clone();
+    covered.fields = vec![vec_id, payload_id];
+    covered.covering_fields = vec![payload_id];
+
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![covered],
+            removed_indices: current.to_vec(),
+        },
+        None,
+    );
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+
+    let fragments_before: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    assert!(
+        fragments_before.len() > 1,
+        "precondition: there must be something to compact"
+    );
+
+    // Compaction of the table must not be blocked by an index it cannot remap.
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .expect("compaction of a covered index must succeed");
+
+    let fragments_after: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    assert_ne!(
+        fragments_after, fragments_before,
+        "compaction rewrote nothing, so the remap path never ran"
+    );
+
+    // The entry survives untouched -- withdrawal skips remapping rather than
+    // deleting metadata -- but it now covers none of the rewritten fragments, so
+    // no query can be answered from a payload the storage never held.
+    let after = dataset.load_indices().await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].covering_fields, vec![payload_id]);
+    let live: roaring::RoaringBitmap = dataset.fragments().iter().map(|f| f.id as u32).collect();
+    let effective = after[0].effective_fragment_bitmap(&live);
+    assert!(
+        effective.is_none_or(|bitmap| bitmap.is_empty()),
+        "a withdrawn covered index must stop covering fragments, got {:?}",
+        after[0].fragment_bitmap
+    );
+}

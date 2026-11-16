@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.datafusion;
+
+import "table_identifier.proto";
+
+message U64Range {
+  uint64 start = 1;
+  uint64 end = 2;
+}
+
+message ProjectionProto {
+  repeated int32 field_ids = 1;
+  bool with_row_id = 2;
+  bool with_row_addr = 3;
+  bool with_row_last_updated_at_version = 4;
+  bool with_row_created_at_version = 5;
+  BlobHandlingProto blob_handling = 6;
+}
+
+message BlobHandlingProto {
+  oneof mode {
+    // All blobs read as binary
+    bool all_binary = 1;
+    // Blobs as descriptions, other binary as binary (default)
+    bool blobs_descriptions = 2;
+    // All binary columns as descriptions
+    bool all_descriptions = 3;
+    // Specific blobs read as binary, rest as descriptions (non-blob binary stays binary)
+    FieldIdSet some_blobs_binary = 4;
+    // Specific columns as binary, all other binary as descriptions
+    FieldIdSet some_binary = 5;
+  }
+}
+
+message FieldIdSet {
+  repeated uint32 field_ids = 1;
+}
+
+message FilteredReadThreadingModeProto {
+  oneof mode {
+    uint64 one_partition_multiple_threads = 1;
+    uint64 multiple_partitions = 2;
+  }
+}
+
+// Serializable form of FilteredReadOptions.
+message FilteredReadOptionsProto {
+  enum ListReadMode {
+    LIST_READ_MODE_UNSPECIFIED = 0;
+    // Preserve exact outer list lengths and validity without element payloads.
+    LIST_READ_MODE_LENGTH = 1;
+    // Preserve outer validity and emptiness; nonempty lengths may become one.
+    LIST_READ_MODE_NON_EMPTY = 2;
+  }
+
+  optional U64Range scan_range_before_filter = 1;
+  optional U64Range scan_range_after_filter = 2;
+  bool with_deleted_rows = 3;
+  optional uint32 batch_size = 4;
+  optional uint64 fragment_readahead = 5;
+  repeated uint64 fragment_ids = 6;
+  ProjectionProto projection = 7;
+  optional bytes refine_filter_substrait = 8;
+  optional bytes full_filter_substrait = 9;
+  FilteredReadThreadingModeProto threading_mode = 10;
+  optional uint64 io_buffer_size_bytes = 11;
+  // Arrow IPC schema for decoding Substrait filters (may be wider than projection).
+  optional bytes filter_schema_ipc = 12;
+  /* If present, a nonzero upper bound on bytes reserved by Blob v2
+   * materialization awaiting ordered emission in one scanner execution.
+   * Admission follows output order; one oversized output batch may exceed the
+   * bound when no other batch is reserved. If absent, Blob v2 materialization
+   * has no independent memory bound.
+   */
+  optional uint64 materialization_readahead_bytes = 13;
+  /* If present, the scanner-level byte budget for output batches. When set,
+   * the file reader uses it as an additional batch boundary alongside the
+   * row-based batch_size. This corresponds to FileReaderOptions.batch_size_bytes.
+   */
+  optional uint64 batch_size_bytes = 14;
+  /* If present, only these physical (fragment_id, row_offset) addresses are
+   * eligible for the scan. The bytes contain a serialized RowAddrTreeMap.
+   * If absent, no physical row-address restriction is applied.
+   * Requires coordinated planner/executor upgrades: mixed-version execution
+   * with executors that do not recognize this field is unsupported. There is
+   * no capability handshake; older executors may silently ignore the restriction.
+   * Must not be combined with scan_range_before_filter. Physical addresses
+   * refer to the exact dataset snapshot used to plan the scan.
+   */
+  optional bytes physical_row_addr_allowlist = 15;
+  /* List field IDs whose consumers need only the specified structural property.
+   * Element values are placeholders and must not be consumed or returned.
+   * An empty map requests ordinary reads. Unspecified or unknown modes are invalid.
+   * Older executors may ignore this field and read full values, preserving results
+   * but losing the optimization. These modes apply only to this read, not the dataset.
+   */
+  map<int32, ListReadMode> list_structure = 16;
+  /* If true, fragment_ids is an explicit fragment selection and may be empty
+   * ("read no fragments"). If false or absent (older planners), an empty
+   * fragment_ids list means no fragment selection; a repeated field alone
+   * cannot distinguish the two. A non-empty list is a selection regardless of
+   * this field. Older executors ignore this field and treat an empty list as
+   * no selection.
+   */
+  optional bool has_fragment_ids = 17;
+}
+
+/* Serializable form of FilteredReadPlan (planned/distributed mode).
+ * RowAddrTreeMap serialized via its built-in serialize_into/deserialize_from.
+ * Per-fragment filters are Substrait-encoded and deduplicated.
+ */
+message FilteredReadPlanProto {
+  bytes row_addr_tree_map = 1;
+  optional U64Range scan_range_after_filter = 2;
+  // Arrow IPC schema for decoding Substrait filters (matches the schema used at encode time).
+  optional bytes filter_schema_ipc = 3;
+  /* Per-fragment filter mapping. Key is fragment id, value is a list index into
+   * filter_expressions. Multiple fragments can share the same list index when
+   * they have the same filter, avoiding duplicate Substrait encoding.
+   */
+  map<uint32, uint32> fragment_filter_ids = 4;
+  /* Deduplicated Substrait-encoded filter expressions. Each entry is referenced
+   * by one or more values in fragment_filter_ids.
+   */
+  repeated bytes filter_expressions = 5;
+}
+
+// Top-level wrapper for FilteredReadExec serialization.
+message FilteredReadExecProto {
+  TableIdentifier table = 1;
+  FilteredReadOptionsProto options = 2;
+  /* FilteredRead has two modes
+   * Plan-then-execute (distributed): The planner creates a FilteredReadPlan and sends it to a remote executor.
+   * Plan-and-execute (local): The executor creates the plan itself at execution time.
+   */
+  optional FilteredReadPlanProto plan = 3;
+  /* Note: FilteredReadExec.index_input (child ExecutionPlan) is NOT serialized here.
+   * DataFusion's PhysicalExtensionCodec handles child plans automatically: it walks
+   * the plan tree via children() / with_new_children(), serializes each node, and
+   * passes deserialized children back as the `inputs` parameter in try_decode.
+   * This means any ExecutionPlan in the tree (including index_input) must also
+   * implement try_encode/try_decode in the PhysicalExtensionCodec.
+   * TODO: implement serialize/deserialize for lance-specific index input ExecutionPlans.
+   */
+}
+
+/* Visibility-aware execution envelope. The V1 messages remain unchanged so
+ * existing Rust callers can keep constructing them with exhaustive literals.
+ * Codecs must select this message using a distinct identifier or negotiated
+ * capability, for example its prost::Name type URL. Fields 1-3 are reserved to
+ * avoid overlap with FilteredReadExecProto: decoding with the wrong version
+ * leaves the required read/options absent and the conversion rejects it.
+ * The caller also transports index children and current-value replay branches.
+ */
+message FilteredReadExecV2Proto {
+  reserved 1 to 3;
+  // Required by conversion; absence is an invalid execution envelope.
+  FilteredReadExecProto read = 4;
+  /* If true, omit fragments outside the scalar index result's coverage.
+   * False preserves the normal fallback scan of unindexed fragments.
+   */
+  bool only_indexed_fragments = 5;
+  /* If present, a serialized RowAddrTreeMap of stale index entries to exclude.
+   * Entries use the index result's identifier domain: stable row IDs on stable-ID
+   * datasets, physical addresses otherwise. This is not a physical allowlist.
+   * If absent, no overlay exclusion is applied.
+   */
+  optional bytes overlay_block = 6;
+}

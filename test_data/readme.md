@@ -1,0 +1,75 @@
+# Lance Test data
+
+Most test cases can be generated from previous versions of Lance format. However
+some require files written by previous versions of Lance.
+
+The folders correspond to the versions of Lance that generated the files. Each
+folder contains a `datagen.py` script that generates one or more lance datasets.
+
+## List of datasets
+
+* `v14.0.2/stable_row_id_*.lance`: Seven datasets written by Lance 14.0.2 with
+  stable row IDs enabled. They cover a contiguous `Range`, sparse
+  `RangeWithHoles`, dense `RangeWithBitmap`, `SortedArray` with both 16-bit and
+  32-bit offsets, an unsorted `Array` from a reverse-order merge, and inline
+  row version sequences with multiple update versions. `expected.json` records
+  the exact `_rowid`, `_row_created_at_version`, and
+  `_row_last_updated_at_version` values plus the `next_row_id` high-water mark
+  of the writer. `datagen.py` regenerates the datasets and expected values with
+  pylance 14.0.2.
+
+* `v14.0.2/blob_v2_raw_reader/blob_v2_raw.lance`: A raw v2.2 file written by
+  the Lance 14.0.2 `LanceFileWriter` with two top-level Blob v2 columns and one
+  nested Blob v2 column. It contains an ordinary `id` column, inline payloads,
+  nulls, and empty values. The writer stores each Blob's descriptor children as
+  anonymous root fields, so the fixture reproduces the released raw-reader
+  failure. `datagen.py` regenerates it with pylance 14.0.2 and asserts that the
+  released reader still rejects the footer.
+
+* `v6.0.1/wrapped_bitpacked_levels.lance`: Synthetic nullable half-float lists
+  with a dense prefix and a long null run. The legacy writer wraps a mini-block
+  structural count at 65,536; its out-of-line bitpacked buffers retain all levels.
+  `test_data/v6.0.1/datagen.py`, run with pylance 6.0.1, regenerates it.
+
+* `v0.7.5/with_deletions`: This is a simple table created with deletions. It is
+  written in a version of Lance that did not record the `Fragment.physical_rows`
+  or `DeletionFile.num_deleted_rows`, so these values are not present in the
+  file. Writers can copy this table and migrate it by filling in those new
+  fields.
+* `v0.8.0/migrated_from_v0.7.5`: This table was originally as above, but was
+  **incorrectly** migrated from v0.7.5. The `Fragment.physical_rows` field is
+  incorrect, as it was filled in with the row count (after deletions). Readers
+  should know to ignore these stats. Writers should correct the statistics.
+* `v0.8.14/corrupt_index`: This dataset has a vector index whose fragment
+  bitmap is incorrect and cannot be trusted.  If the writer version is 0.8.14
+  or older then bugs may occur when searching this kind of dataset.  There is
+  no good workaround for readers.  Writers should make sure to recompute the
+  fragment bitmap when updating indices that were sourced from old versions.
+* `v0.10.5/corrupt_schema`: This dataset had `add_columns` and `drop_columns`
+  applied to it. In earlier versions of Lance, the field ids were not handled
+  correctly, so there are duplicate field ids in the schema. There aren't great
+  workarounds for readers. Writers should make sure to check the field ids in
+  the schema and re-compute them if necessary.
+* `v0.10.15/non_divisible_pq`: This dataset has an 8-bit IVF-PQ index whose
+  64-dimensional vectors were divided into 14 sub-vectors. Writers at this
+  version silently omitted the final eight dimensions from the PQ codebook.
+  Readers should preserve that prefix-only search behavior.
+* `v0.27.1/pq_in_schema`: This dataset uses the old method of storing the PQ
+  metadata in the schema metadata in the index file. We switched to storing them
+  in a global buffer in https://github.com/lancedb/lance/pull/3829, but still
+  need to be able to read the old format.
+* `v3.0.1/fts_v1` and `v4.0.1/fts_v2`: These datasets cover the supported FTS
+  layouts written by stable Lance releases. Each fixture contains posting lists
+  that cross the layout's block boundary and positions used by phrase queries.
+  The v1 fixture also retains the retired `skip_merge` parameter written by Lance
+  3.0.1.
+* `v8.0.0/decimal_zonemap`: This dataset has a Decimal128 ZoneMap whose non-null
+  values have null min/max statistics because Decimal extrema were not computed
+  by Lance 8.0.0.
+* `v8.0.0/blobs/v2.0.lance` and `v8.0.0/blobs/v2.1.lance`: Legacy Blob
+  columns containing a payload, null, and empty bytes. These fixtures cover
+  reading released files alongside newly appended Blob v2 files.
+* `v10.0.0/null_slot_v2_0.lance` and `v10.0.0/disjoint_v2_1.lance`: Int8
+  dictionary columns whose pages store 32-bit indices. Lance 10.0.0 widened
+  them for the null slot it appended past the last Int8 key, and for two
+  chunks whose dictionaries did not fit Int8 together.
